@@ -164,6 +164,47 @@ Decode GEMM summary
   failed: 0
 ```
 
+## 原生与自研环境结果对比
+
+仓库提供：
+
+```text
+collect_gemm_results.py           日志解析和结果合并脚本
+gemm_performance_comparison.xlsx  Excel 对比模板
+```
+
+先在原生环境保存完整日志：
+
+```bash
+./run_gemm.sh --model 7b | tee native.log
+python3 collect_gemm_results.py \
+  --environment native \
+  --log native.log \
+  --output gemm_comparison.csv
+```
+
+再在自研环境保存日志，并回填同一个 CSV：
+
+```bash
+./run_gemm.sh --model 7b | tee custom.log
+python3 collect_gemm_results.py \
+  --environment custom \
+  --log custom.log \
+  --output gemm_comparison.csv
+```
+
+两个环境也可以只负责生成日志，然后把 `native.log` 和 `custom.log` 复制到同一台机器上执行上述两个合并命令。
+
+生成的 `gemm_comparison.csv` 包含：
+
+- 上下文长度和算子名称
+- `M/N/K`
+- 原生最佳配置与 GFLOPS
+- 自研最佳配置与 GFLOPS
+- 自研相对原生的加速比
+
+Excel 模板预置了 Qwen2.5-7B 的45个 Decode 用例。可将 CSV 中对应列的数据粘贴到模板的原生和自研结果列，加速比会自动计算并高亮。
+
 ## 注意事项
 
 - A、B、C/D 的 alignment 均为8，因此 Decode shape 需要满足 `K % 8 == 0` 和 `N % 8 == 0`。
