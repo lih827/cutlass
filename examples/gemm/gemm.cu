@@ -33,49 +33,63 @@ using ElementC = cutlass::half_t;
 using ElementAccumulator = cutlass::half_t;
 using ElementCompute = cutlass::half_t;
 
-using LayoutA = cutlass::layout::RowMajor;
-using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
+using LayoutAM1 = cutlass::layout::RowMajor;
+using LayoutBM1 = cutlass::layout::ColumnMajor;
+using LayoutCM1 = cutlass::layout::RowMajor;
+
+using LayoutAAttention = cutlass::layout::ColumnMajor;
+using LayoutBAttention = cutlass::layout::ColumnMajor;
+using LayoutCAttention = cutlass::layout::ColumnMajor;
 
 using OperatorClass = cutlass::arch::OpClassTensorOp;
 using ArchTag = cutlass::arch::Sm80;
 using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 
-constexpr int kAlignmentA = 8;
-constexpr int kAlignmentB = 8;
-constexpr int kAlignmentC = 8;
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementC, kAlignmentC, ElementAccumulator, ElementCompute>;
+constexpr int kAlignmentAM1 = 8;
+constexpr int kAlignmentBM1 = 8;
+constexpr int kAlignmentCM1 = 8;
+constexpr int kAlignmentAAttention = 4;
+constexpr int kAlignmentBAttention = 8;
+constexpr int kAlignmentCAttention = 4;
 
-template <typename ThreadblockShape, typename WarpShape,
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC,
+          typename ThreadblockShape, typename WarpShape,
           typename ThreadblockSwizzle, int kStages>
 using GemmConfiguration = cutlass::gemm::device::GemmUniversal<
     ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
     ElementAccumulator, OperatorClass, ArchTag,
     ThreadblockShape, WarpShape, InstructionShape,
-    EpilogueOp, ThreadblockSwizzle, kStages, kAlignmentA, kAlignmentB>;
+    cutlass::epilogue::thread::LinearCombination<
+        ElementC, kAlignmentC, ElementAccumulator, ElementCompute>,
+    ThreadblockSwizzle, kStages, kAlignmentA, kAlignmentB>;
 
 // Candidate 1: skinny-M GEMMs with abundant parallelism in N.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC>
 using LinearGemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
     cutlass::gemm::GemmShape<32, 256, 32>,
     cutlass::gemm::GemmShape<32, 64, 32>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 4>;
 
 // Candidate 2: short-K attention QK^T GEMMs.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC>
 using AttentionQKGemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
     cutlass::gemm::GemmShape<32, 128, 32>,
     cutlass::gemm::GemmShape<16, 64, 32>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
 
 // Candidate 3: long-K attention AV and other low-tile-count GEMMs.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC>
 using AttentionAVStreamKGemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
     cutlass::gemm::GemmShape<32, 128, 32>,
     cutlass::gemm::GemmShape<16, 64, 32>,
     cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 4>;
-
-using ReferenceGemm = cutlass::reference::device::Gemm<
-    ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
-    ElementAccumulator, ElementCompute>;
 
 template <typename T>
 struct ConfigName {
@@ -120,7 +134,7 @@ struct ConfigName<
 
 struct Options {
   bool help = false;
-  int m = 1024;
+  int m = 1;
   int n = 1024;
   int k = 1024;
   float alpha = 1.0f;
@@ -139,16 +153,26 @@ struct Options {
   }
 
   bool valid() const {
-    return m > 0 && n > 0 && k > 0 && iterations > 0 &&
-           (k % kAlignmentA == 0) &&
-           (k % kAlignmentB == 0) &&
-           (n % kAlignmentC == 0);
+    if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0) {
+      return false;
+    }
+    if (m == 1) {
+      return (k % kAlignmentAM1 == 0) &&
+             (k % kAlignmentBM1 == 0) &&
+             (n % kAlignmentCM1 == 0);
+    }
+    if (m == 28) {
+      return (m % kAlignmentAAttention == 0) &&
+             (k % kAlignmentBAttention == 0) &&
+             (m % kAlignmentCAttention == 0);
+    }
+    return false;
   }
 
   void print_usage(char const *program) const {
     std::cout
         << "Usage: " << program << " [options]\n\n"
-        << "  --m=<int>            GEMM M dimension (default: 1024)\n"
+        << "  --m=<int>            GEMM M dimension: 1 or 28 (default: 1)\n"
         << "  --n=<int>            GEMM N dimension (default: 1024)\n"
         << "  --k=<int>            GEMM K dimension (default: 1024)\n"
         << "  --alpha=<float>      Epilogue alpha (default: 1.0)\n"
@@ -158,7 +182,12 @@ struct Options {
   }
 };
 
+template <typename LayoutA_, typename LayoutB_, typename LayoutC_>
 struct Tensors {
+  using LayoutA = LayoutA_;
+  using LayoutB = LayoutB_;
+  using LayoutC = LayoutC_;
+
   cutlass::HostTensor<ElementA, LayoutA> a;
   cutlass::HostTensor<ElementB, LayoutB> b;
   cutlass::HostTensor<ElementC, LayoutC> c;
@@ -182,7 +211,8 @@ struct Result {
     }                                                                                    \
   } while (false)
 
-bool initialize_tensors(Options const &options, Tensors &tensors) {
+template <typename TensorSet>
+bool initialize_tensors(Options const &options, TensorSet &tensors) {
   tensors.a.resize({options.m, options.k});
   tensors.b.resize({options.k, options.n});
   tensors.c.resize({options.m, options.n});
@@ -207,7 +237,13 @@ bool initialize_tensors(Options const &options, Tensors &tensors) {
   return true;
 }
 
-bool compute_reference(Options const &options, Tensors &tensors) {
+template <typename TensorSet>
+bool compute_reference(Options const &options, TensorSet &tensors) {
+  using ReferenceGemm = cutlass::reference::device::Gemm<
+      ElementA, typename TensorSet::LayoutA,
+      ElementB, typename TensorSet::LayoutB,
+      ElementC, typename TensorSet::LayoutC,
+      ElementAccumulator, ElementCompute>;
   ReferenceGemm reference_gemm;
   reference_gemm(
       {options.m, options.n, options.k},
@@ -222,7 +258,8 @@ bool compute_reference(Options const &options, Tensors &tensors) {
 
 template <typename Gemm, typename Swizzle = typename Gemm::ThreadblockSwizzle>
 struct ArgumentFactory {
-  static typename Gemm::Arguments make(Options const &options, Tensors &tensors) {
+  template <typename TensorSet>
+  static typename Gemm::Arguments make(Options const &options, TensorSet &tensors) {
     return typename Gemm::Arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
@@ -242,7 +279,8 @@ struct ArgumentFactory {
 template <typename Gemm>
 struct ArgumentFactory<
     Gemm, cutlass::gemm::threadblock::ThreadblockSwizzleStreamK> {
-  static typename Gemm::Arguments make(Options const &options, Tensors &tensors) {
+  template <typename TensorSet>
+  static typename Gemm::Arguments make(Options const &options, TensorSet &tensors) {
     return typename Gemm::Arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
@@ -260,8 +298,8 @@ struct ArgumentFactory<
   }
 };
 
-template <typename Gemm>
-Result run_tensorop_gemm(Options const &options, Tensors &tensors) {
+template <typename Gemm, typename TensorSet>
+Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
   Result result;
   Gemm gemm;
   typename Gemm::Arguments arguments =
@@ -329,11 +367,11 @@ void print_configuration(char const *configuration_name, Options const &options)
       << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
       << "  iterations: " << options.iterations << "\n"
       << "  A: " << ConfigName<ElementA>::value() << ", "
-      << ConfigName<LayoutA>::value() << "\n"
+      << ConfigName<typename Gemm::LayoutA>::value() << "\n"
       << "  B: " << ConfigName<ElementB>::value() << ", "
-      << ConfigName<LayoutB>::value() << "\n"
+      << ConfigName<typename Gemm::LayoutB>::value() << "\n"
       << "  C: " << ConfigName<ElementC>::value() << ", "
-      << ConfigName<LayoutC>::value() << "\n"
+      << ConfigName<typename Gemm::LayoutC>::value() << "\n"
       << "  accumulator: " << ConfigName<ElementAccumulator>::value() << "\n"
       << "  operator class / arch: "
       << ConfigName<typename Gemm::OperatorClass>::value() << " / "
@@ -371,71 +409,35 @@ void print_result(char const *configuration_name, Result const &result) {
             << "  gflops: " << result.gflops << "\n";
 }
 
-}  // namespace
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC>
+int profile_all_candidates(Options const &options) {
+  using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
+  using Linear = LinearGemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
+  using AttentionQK = AttentionQKGemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
+  using AttentionAV = AttentionAVStreamKGemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
 
-int main(int argc, char const **argv) {
-  // Step 1: require CUDA Toolkit 9.0 or newer.
-#if !defined(__CUDACC_VER_MAJOR__) || (__CUDACC_VER_MAJOR__ < 9)
-  std::cerr << "This example requires CUDA Toolkit 9.0 or newer.\n";
-  return EXIT_FAILURE;
-#endif
-
-  // Step 2: parse arguments.
-  Options options;
-  options.parse(argc, argv);
-  if (options.help) {
-    options.print_usage(argv[0]);
-    return EXIT_SUCCESS;
-  }
-  if (!options.valid()) {
-    std::cerr
-        << "Invalid problem: dimensions and iterations must be positive; "
-        << "k must satisfy A/B alignment and n must satisfy C/D alignment.\n";
-    options.print_usage(argv[0]);
+  TensorSet tensors;
+  if (!initialize_tensors(options, tensors) ||
+      !compute_reference(options, tensors)) {
     return EXIT_FAILURE;
   }
 
-  // Step 3: select the device and check it immediately before GEMM setup/execution.
-  int device_id = 0;
-  cudaDeviceProp device_properties{};
-  cudaError_t cuda_status = cudaSetDevice(device_id);
-  if (cuda_status != cudaSuccess) {
-    std::cerr << "cudaSetDevice(" << device_id << ") failed: "
-              << cudaGetErrorString(cuda_status) << "\n";
-    return EXIT_FAILURE;
-  }
-  cuda_status = cudaGetDeviceProperties(&device_properties, device_id);
-  if (cuda_status != cudaSuccess) {
-    std::cerr << "cudaGetDeviceProperties failed: "
-              << cudaGetErrorString(cuda_status) << "\n";
-    return EXIT_FAILURE;
-  }
-  if (device_properties.major * 10 + device_properties.minor < 80) {
-    std::cerr << "This example requires SM80 or newer; detected SM"
-              << device_properties.major << device_properties.minor << ".\n";
-    return EXIT_FAILURE;
-  }
-
-  // Step 4: initialize tensors and compute the reference result once.
-  Tensors tensors;
-  if (!initialize_tensors(options, tensors) || !compute_reference(options, tensors)) {
-    return EXIT_FAILURE;
-  }
-
-  // Step 5: run all TensorOp candidates against the same data and reference result.
-  print_configuration<LinearGemm>("Linear", options);
-  Result linear = run_tensorop_gemm<LinearGemm>(options, tensors);
+  print_configuration<Linear>("Linear", options);
+  Result linear = run_tensorop_gemm<Linear>(options, tensors);
   print_result("Linear", linear);
 
-  print_configuration<AttentionQKGemm>("Attention QK^T", options);
-  Result attention_qk = run_tensorop_gemm<AttentionQKGemm>(options, tensors);
+  print_configuration<AttentionQK>("Attention QK^T", options);
+  Result attention_qk = run_tensorop_gemm<AttentionQK>(options, tensors);
   print_result("Attention QK^T", attention_qk);
 
-  print_configuration<AttentionAVStreamKGemm>("Attention AV Stream-K", options);
-  Result attention_av = run_tensorop_gemm<AttentionAVStreamKGemm>(options, tensors);
+  print_configuration<AttentionAV>("Attention AV Stream-K", options);
+  Result attention_av = run_tensorop_gemm<AttentionAV>(options, tensors);
   print_result("Attention AV Stream-K", attention_av);
 
-  // Step 6: report the fastest candidate that also passed verification.
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
   if (linear.status == cutlass::Status::kSuccess && linear.passed) {
@@ -462,4 +464,62 @@ int main(int argc, char const **argv) {
             << "  avg_time: " << best_result->avg_time_ms << " ms\n"
             << "  gflops: " << best_result->gflops << "\n";
   return EXIT_SUCCESS;
+}
+
+}  // namespace
+
+int main(int argc, char const **argv) {
+  // Step 1: require CUDA Toolkit 9.0 or newer.
+#if !defined(__CUDACC_VER_MAJOR__) || (__CUDACC_VER_MAJOR__ < 9)
+  std::cerr << "This example requires CUDA Toolkit 9.0 or newer.\n";
+  return EXIT_FAILURE;
+#endif
+
+  // Step 2: parse arguments.
+  Options options;
+  options.parse(argc, argv);
+  if (options.help) {
+    options.print_usage(argv[0]);
+    return EXIT_SUCCESS;
+  }
+  if (!options.valid()) {
+    std::cerr
+        << "Invalid problem: M must be 1 or 28. For M=1, K/N must be "
+        << "aligned to 8. For M=28, K must be aligned to 8 and the "
+        << "column-major A/C leading dimension uses alignment 4.\n";
+    options.print_usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  // Step 3: select the device and check it immediately before GEMM setup/execution.
+  int device_id = 0;
+  cudaDeviceProp device_properties{};
+  cudaError_t cuda_status = cudaSetDevice(device_id);
+  if (cuda_status != cudaSuccess) {
+    std::cerr << "cudaSetDevice(" << device_id << ") failed: "
+              << cudaGetErrorString(cuda_status) << "\n";
+    return EXIT_FAILURE;
+  }
+  cuda_status = cudaGetDeviceProperties(&device_properties, device_id);
+  if (cuda_status != cudaSuccess) {
+    std::cerr << "cudaGetDeviceProperties failed: "
+              << cudaGetErrorString(cuda_status) << "\n";
+    return EXIT_FAILURE;
+  }
+  if (device_properties.major * 10 + device_properties.minor < 80) {
+    std::cerr << "This example requires SM80 or newer; detected SM"
+              << device_properties.major << device_properties.minor << ".\n";
+    return EXIT_FAILURE;
+  }
+
+  // Step 4: select the physical layout used by the cuBLAS comparison.
+  if (options.m == 1) {
+    return profile_all_candidates<
+        LayoutAM1, LayoutBM1, LayoutCM1,
+        kAlignmentAM1, kAlignmentBM1, kAlignmentCM1>(options);
+  }
+  return profile_all_candidates<
+      LayoutAAttention, LayoutBAttention, LayoutCAttention,
+      kAlignmentAAttention, kAlignmentBAttention,
+      kAlignmentCAttention>(options);
 }
