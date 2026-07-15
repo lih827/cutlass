@@ -1,59 +1,42 @@
 #!/usr/bin/env python3
-"""Parse run_gemm.sh output and update only the CUTLASS columns."""
+"""Parse CUTLASS GEMM output and write results directly into the XLSX template."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from openpyxl import load_workbook
+except ImportError:  # pragma: no cover - depends on the target Linux environment
+    load_workbook = None
+
 
 CASE_RE = re.compile(
     r"^\[(?P<index>\d+)/(?P<total>\d+)\]\s+"
-    r"L=(?P<length>\d+)\s+op=(?P<operation>.+?)\s+"
+    r"L=(?P<context_lengths>\S+)\s+ops=(?P<source_operations>.+?)\s+"
+    r"MxNxK=(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)\s*$"
+)
+LEGACY_CASE_RE = re.compile(
+    r"^\[(?P<index>\d+)/(?P<total>\d+)\]\s+"
+    r"L=(?P<context_lengths>\d+)\s+op=(?P<source_operations>.+?)\s+"
     r"MxNxK=(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)\s*$"
 )
 BEST_RE = re.compile(r"^Best configuration:\s*(?P<configuration>.+?)\s*$")
 GFLOPS_RE = re.compile(r"^\s*gflops:\s*(?P<gflops>[0-9]+(?:\.[0-9]+)?)\s*$")
 
-COLUMNS = [
-    "case_id",
-    "context_length",
-    "operation",
-    "m",
-    "n",
-    "k",
-    "cutlass_best_config",
-    "cutlass_gflops",
-    "hgemm_custom_best_config",
-    "hgemm_custom_gflops",
-    "hgemm_cuda_best_config",
-    "hgemm_cuda_gflops",
-    "hgemm_custom_vs_cutlass_speedup",
-    "hgemm_cuda_vs_cutlass_speedup",
-    "manual_selection_notes",
-]
-
-LEGACY_COLUMNS = [
-    "case_id", "context_length", "operation", "m", "n", "k",
-    "native_best_config", "native_gflops", "custom_best_config",
-    "custom_gflops", "custom_vs_native_speedup",
-]
-
-NV_COLUMNS = [
-    "case_id", "context_length", "operation", "m", "n", "k",
-    "nv_best_config", "nv_gflops", "custom_best_config", "custom_gflops",
-    "custom_vs_nv_speedup", "custom_selection_notes",
-]
+SHEET_NAME = "环境对比"
+HEADER_ROW = 5
+FIRST_DATA_ROW = 6
 
 
 @dataclass(frozen=True)
 class ParsedResult:
-    context_length: int
-    operation: str
+    context_lengths: str
+    source_operations: str
     m: int
     n: int
     k: int
@@ -61,21 +44,28 @@ class ParsedResult:
     gflops: float
 
     @property
-    def case_id(self) -> str:
-        normalized_op = re.sub(r"[^a-z0-9]+", "_", self.operation.lower()).strip("_")
-        return f"l{self.context_length}_{normalized_op}_{self.m}x{self.n}x{self.k}"
+    def shape(self) -> tuple[int, int, int]:
+        return self.m, self.n, self.k
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Parse CUTLASS gemm output and update the CUTLASS result columns. "
-            "HGEMM (self-developed/CUDA) results are selected and entered manually."
+            "Parse CUTLASS gemm output and update the CUTLASS columns in the "
+            "performance comparison XLSX workbook. HGEMM data is preserved."
         )
     )
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument(
-        "--output", type=Path, default=Path("gemm_performance_comparison.csv")
+        "--workbook",
+        type=Path,
+        default=Path("gemm_performance_comparison.xlsx"),
+        help="XLSX template to read (default: gemm_performance_comparison.xlsx)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output XLSX path; omit to update --workbook in place",
     )
     return parser.parse_args()
 
@@ -83,12 +73,12 @@ def parse_args() -> argparse.Namespace:
 def parse_log(path: Path) -> list[ParsedResult]:
     current_case: dict[str, str] | None = None
     pending_configuration: str | None = None
-    results: list[ParsedResult] = []
+    results: dict[tuple[int, int, int], ParsedResult] = {}
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for raw_line in stream:
             line = raw_line.rstrip("\r\n")
-            case_match = CASE_RE.match(line)
+            case_match = CASE_RE.match(line) or LEGACY_CASE_RE.match(line)
             if case_match:
                 current_case = case_match.groupdict()
                 pending_configuration = None
@@ -101,113 +91,99 @@ def parse_log(path: Path) -> list[ParsedResult]:
 
             gflops_match = GFLOPS_RE.match(line)
             if gflops_match and current_case and pending_configuration:
-                results.append(
-                    ParsedResult(
-                        context_length=int(current_case["length"]),
-                        operation=current_case["operation"],
-                        m=int(current_case["m"]),
-                        n=int(current_case["n"]),
-                        k=int(current_case["k"]),
-                        best_configuration=pending_configuration,
-                        gflops=float(gflops_match.group("gflops")),
-                    )
+                result = ParsedResult(
+                    context_lengths=current_case["context_lengths"],
+                    source_operations=current_case["source_operations"],
+                    m=int(current_case["m"]),
+                    n=int(current_case["n"]),
+                    k=int(current_case["k"]),
+                    best_configuration=pending_configuration,
+                    gflops=float(gflops_match.group("gflops")),
                 )
+                results[result.shape] = result
                 pending_configuration = None
 
     if not results:
         raise ValueError(
-            f"No complete cases found in {path}. "
-            "The log must contain run_gemm.sh case headers and gemm's Best configuration/GFLOPS output."
+            f"No complete cases found in {path}. The log must contain case headers "
+            "and gemm's Best configuration/GFLOPS output."
         )
-    return results
+    return list(results.values())
 
 
-def load_existing(path: Path) -> dict[str, dict[str, str]]:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames in (LEGACY_COLUMNS, NV_COLUMNS):
-            migrated = {}
-            for old in reader:
-                row = {column: "" for column in COLUMNS}
-                row.update({key: old.get(key, "") for key in COLUMNS if key in old})
-                row["cutlass_best_config"] = old.get("nv_best_config", old.get("native_best_config", ""))
-                row["cutlass_gflops"] = old.get("nv_gflops", old.get("native_gflops", ""))
-                row["hgemm_custom_best_config"] = old.get("custom_best_config", "")
-                row["hgemm_custom_gflops"] = old.get("custom_gflops", "")
-                row["hgemm_custom_vs_cutlass_speedup"] = old.get(
-                    "custom_vs_nv_speedup", old.get("custom_vs_native_speedup", "")
-                )
-                row["manual_selection_notes"] = old.get("custom_selection_notes", "")
-                migrated[row["case_id"]] = row
-            return migrated
-        if reader.fieldnames != COLUMNS:
-            raise ValueError(f"Unexpected columns in {path}: {reader.fieldnames}")
-        return {row["case_id"]: row for row in reader}
+def find_shape_rows(sheet) -> dict[tuple[int, int, int], int]:
+    expected_headers = {
+        "C": "M",
+        "D": "N",
+        "E": "K",
+        "F": "CUTLASS最佳配置（脚本回填）",
+        "G": "CUTLASS GFLOPS（脚本回填）",
+    }
+    for column, expected in expected_headers.items():
+        actual = sheet[f"{column}{HEADER_ROW}"].value
+        if actual != expected:
+            raise ValueError(
+                f"Unexpected template header {column}{HEADER_ROW}: {actual!r}; "
+                f"expected {expected!r}."
+            )
+
+    rows: dict[tuple[int, int, int], int] = {}
+    for row in range(FIRST_DATA_ROW, sheet.max_row + 1):
+        values = [sheet.cell(row, column).value for column in (3, 4, 5)]
+        if all(isinstance(value, (int, float)) for value in values):
+            shape = tuple(int(value) for value in values)
+            if shape in rows:
+                raise ValueError(f"Duplicate M/N/K in XLSX template: {shape}")
+            rows[shape] = row
+    return rows
 
 
-def update_rows(
-    rows: dict[str, dict[str, str]],
-    results: list[ParsedResult],
-) -> None:
+def update_workbook(template: Path, output: Path, results: list[ParsedResult]) -> None:
+    if load_workbook is None:
+        raise RuntimeError(
+            "openpyxl is required to update XLSX files. Install it with: "
+            "python3 -m pip install openpyxl"
+        )
+    if template.suffix.lower() != ".xlsx" or output.suffix.lower() != ".xlsx":
+        raise ValueError("--workbook and --output must use the .xlsx extension")
+    if not template.exists():
+        raise FileNotFoundError(f"XLSX template does not exist: {template}")
+
+    workbook = load_workbook(template)
+    if SHEET_NAME not in workbook.sheetnames:
+        raise ValueError(f"Worksheet not found: {SHEET_NAME}")
+    sheet = workbook[SHEET_NAME]
+    shape_rows = find_shape_rows(sheet)
+
+    missing = [result.shape for result in results if result.shape not in shape_rows]
+    if missing:
+        formatted = ", ".join(f"{m}x{n}x{k}" for m, n, k in missing)
+        raise ValueError(f"M/N/K not found in XLSX template: {formatted}")
+
     for result in results:
-        row = rows.setdefault(result.case_id, {column: "" for column in COLUMNS})
-        row.update(
-            {
-                "case_id": result.case_id,
-                "context_length": str(result.context_length),
-                "operation": result.operation,
-                "m": str(result.m),
-                "n": str(result.n),
-                "k": str(result.k),
-                "cutlass_best_config": result.best_configuration,
-                "cutlass_gflops": f"{result.gflops:.4f}",
-            }
-        )
-        cutlass = float(row["cutlass_gflops"]) if row["cutlass_gflops"] else 0.0
-        custom = float(row["hgemm_custom_gflops"]) if row["hgemm_custom_gflops"] else 0.0
-        cuda = float(row["hgemm_cuda_gflops"]) if row["hgemm_cuda_gflops"] else 0.0
-        row["hgemm_custom_vs_cutlass_speedup"] = (
-            f"{custom / cutlass:.4f}" if cutlass > 0.0 and custom > 0.0 else ""
-        )
-        row["hgemm_cuda_vs_cutlass_speedup"] = (
-            f"{cuda / cutlass:.4f}" if cutlass > 0.0 and cuda > 0.0 else ""
-        )
+        row = shape_rows[result.shape]
+        sheet.cell(row, 1).value = result.context_lengths
+        sheet.cell(row, 2).value = result.source_operations
+        sheet.cell(row, 6).value = result.best_configuration
+        sheet.cell(row, 7).value = result.gflops
 
-
-def write_table(path: Path, rows: dict[str, dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(
-        rows.values(),
-        key=lambda row: (
-            int(row["context_length"]),
-            row["operation"],
-            int(row["m"]),
-            int(row["n"]),
-            int(row["k"]),
-        ),
-    )
-    with path.open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=COLUMNS)
-        writer.writeheader()
-        writer.writerows(ordered)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output)
 
 
 def main() -> int:
     args = parse_args()
+    output = args.output or args.workbook
     try:
-        parsed = parse_log(args.log)
-        rows = load_existing(args.output)
-        update_rows(rows, parsed)
-        write_table(args.output, rows)
-    except (OSError, ValueError) as error:
+        results = parse_log(args.log)
+        update_workbook(args.workbook, output, results)
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
     print(
-        f"Updated {len(parsed)} CUTLASS cases in {args.output.resolve()}; "
-        "HGEMM (self-developed/CUDA) columns were preserved for manual selection."
+        f"Updated {len(results)} CUTLASS cases in {output.resolve()}; "
+        "HGEMM values, formulas, and formatting were preserved."
     )
     return 0
 

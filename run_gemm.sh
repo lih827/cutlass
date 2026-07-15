@@ -105,17 +105,16 @@ if ((dry_run == 0)) && [[ ! -x "$executable" ]]; then
 fi
 
 IFS=',' read -r -a lengths <<< "$lengths_csv"
-operations=(
+base_operations=(
   "Q"
   "K"
   "V"
-  "Attention QK^T"
-  "Attention AV"
   "Attention Out"
   "MLP Up/Gate"
   "MLP Down"
   "LM Head"
 )
+attention_operations=("Attention QK^T" "Attention AV")
 
 for length in "${lengths[@]}"; do
   if ! [[ "$length" =~ ^[1-9][0-9]*$ ]]; then
@@ -143,19 +142,66 @@ shape_for_decode_op() {
   esac
 }
 
-total_cases=$((${#lengths[@]} * ${#operations[@]}))
+declare -A shape_to_slot=()
+declare -a case_m=() case_n=() case_k=() case_operations=() case_lengths=()
+
+add_unique_case() {
+  local operation="$1"
+  local context_length="$2"
+  local key="${m}x${n}x${k}"
+  local slot
+
+  if [[ -n "${shape_to_slot[$key]+present}" ]]; then
+    slot="${shape_to_slot[$key]}"
+    if [[ " / ${case_operations[$slot]} / " != *" / $operation / "* ]]; then
+      case_operations[$slot]+=" / $operation"
+    fi
+    if [[ ",${case_lengths[$slot]}," != *",$context_length,"* ]]; then
+      case_lengths[$slot]+=",$context_length"
+    fi
+    return
+  fi
+
+  slot=${#case_m[@]}
+  shape_to_slot[$key]=$slot
+  case_m[$slot]=$m
+  case_n[$slot]=$n
+  case_k[$slot]=$k
+  case_operations[$slot]="$operation"
+  case_lengths[$slot]="$context_length"
+}
+
+# L does not affect these GEMMs. Generate them once, then merge equal M/N/K
+# shapes such as Q/Attention Out and K/V.
+for operation in "${base_operations[@]}"; do
+  shape_for_decode_op "$operation" 1
+  add_unique_case "$operation" "-"
+done
+
+# Only attention GEMMs depend on decode context length L.
+for context_length in "${lengths[@]}"; do
+  for operation in "${attention_operations[@]}"; do
+    shape_for_decode_op "$operation" "$context_length"
+    add_unique_case "$operation" "$context_length"
+  done
+done
+
+total_cases=${#case_m[@]}
 failed_cases=0
 case_index=0
 
 echo "Model: Qwen2.5-$model"
 echo "Parameters: H=$h, heads=$heads, kv_heads=$kv_heads, head_dim=$head_dim, intermediate=$intermediate, vocab=$vocab, batch=$batch"
 echo "Decode lengths: ${lengths[*]}"
-echo "Cases: $total_cases"
+echo "Unique GEMM cases (deduplicated by M/N/K): $total_cases"
 
-for context_length in "${lengths[@]}"; do
-  for operation in "${operations[@]}"; do
+for slot in "${!case_m[@]}"; do
     ((case_index += 1))
-    shape_for_decode_op "$operation" "$context_length"
+    m=${case_m[$slot]}
+    n=${case_n[$slot]}
+    k=${case_k[$slot]}
+    operations_label=${case_operations[$slot]}
+    lengths_label=${case_lengths[$slot]}
     command=(
       "$executable"
       "--m=$m"
@@ -166,8 +212,8 @@ for context_length in "${lengths[@]}"; do
       "--iterations=$iterations"
     )
 
-    printf '\n[%d/%d] L=%d op=%s MxNxK=%dx%dx%d\n' \
-      "$case_index" "$total_cases" "$context_length" "$operation" "$m" "$n" "$k"
+    printf '\n[%d/%d] L=%s ops=%s MxNxK=%dx%dx%d\n' \
+      "$case_index" "$total_cases" "$lengths_label" "$operations_label" "$m" "$n" "$k"
     printf 'Command:'
     printf ' %q' "${command[@]}"
     printf '\n'
@@ -180,9 +226,8 @@ for context_length in "${lengths[@]}"; do
     exit_code=$?
     if ((exit_code != 0)); then
       ((failed_cases += 1))
-      echo "FAILED: exit_code=$exit_code L=$context_length op=$operation MxNxK=${m}x${n}x${k}" >&2
+      echo "FAILED: exit_code=$exit_code L=$lengths_label ops=$operations_label MxNxK=${m}x${n}x${k}" >&2
     fi
-  done
 done
 
 printf '\nDecode GEMM summary\n'

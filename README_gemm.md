@@ -24,6 +24,7 @@ cutlass/
 
 - Linux
 - Bash 4.0 或更高版本
+- Python 3 和 `openpyxl`
 - CUDA Toolkit
 - CUTLASS 源码
 - SM80 或更高架构的 NVIDIA GPU
@@ -34,6 +35,12 @@ cutlass/
 ArchTag         = Sm80
 OperatorClass   = OpClassTensorOp
 InstructionShape = 16x8x16
+```
+
+安装 XLSX 回填依赖：
+
+```bash
+python3 -m pip install openpyxl
 ```
 
 ## 添加执行权限
@@ -87,7 +94,9 @@ examples/gemm/gemm
 128, 256, 512, 1024, 2048
 ```
 
-每个长度包含9个算子，共45个用例。每个用例都会比较：
+脚本先生成算子形状，再严格按 `M/N/K` 去重：与 `L` 无关的 Linear GEMM 只运行一次；只有 `Attention QK^T` 和 `Attention AV` 会随 `L` 生成新形状。相同形状的来源算子会合并记录，例如 `Q / Attention Out` 和 `K / V`。
+
+默认 Qwen2.5-7B 最终运行 14 个唯一 GEMM，而不是原始展开后的 45 次调用。每个唯一 GEMM 都会比较：
 
 - Linear
 - Attention QK^T
@@ -159,8 +168,8 @@ examples/gemm/gemm
 
 ```text
 Decode GEMM summary
-  total: 45
-  passed: 45
+  total: 14
+  passed: 14
   failed: 0
 ```
 
@@ -173,27 +182,40 @@ collect_gemm_results.py           CUTLASS 日志解析和结果回填脚本
 gemm_performance_comparison.xlsx  Excel 对比模板
 ```
 
-先运行 CUTLASS 用例并保存完整日志。脚本只自动更新 CUTLASS 最佳配置和 GFLOPS：
+先运行 CUTLASS 用例并保存完整日志。脚本按 `M/N/K` 定位 Excel 模板中的行，只更新 CUTLASS 最佳配置和 GFLOPS；HGEMM 数据、加速比公式和格式均会保留。
+
+直接更新原始 XLSX：
 
 ```bash
 ./run_gemm.sh --model 7b | tee cutlass.log
 python3 collect_gemm_results.py \
   --log cutlass.log \
-  --output gemm_performance_comparison.csv
+  --workbook gemm_performance_comparison.xlsx
 ```
 
-HGEMM（自研）和 HGEMM（CUDA）数据来自其他测试程序，输出格式与 `gemm.cu` 不同，因此不由脚本解析。请按相同的上下文长度、算子和 `M/N/K` 分别人工筛选两类 HGEMM 最佳结果，再填写 Excel 模板中的人工录入列。
+如需保留空白模板，可输出到新 XLSX：
 
-生成的 `gemm_performance_comparison.csv` 包含：
+```bash
+python3 collect_gemm_results.py \
+  --log cutlass.log \
+  --workbook gemm_performance_comparison.xlsx \
+  --output gemm_performance_comparison_filled.xlsx
+```
 
-- 上下文长度和算子名称
+`--output` 必须使用 `.xlsx` 后缀；省略时原地更新 `--workbook`。如果日志中的 `M/N/K` 不存在于模板中，脚本会报错且不会写入不完整结果。
+
+HGEMM（自研）和 HGEMM（CUDA）数据来自其他测试程序，输出格式与 `gemm.cu` 不同，因此不由脚本解析。请按相同的 `M/N/K` 分别人工筛选两类 HGEMM 最佳 GFLOPS，再填写 Excel 模板中的人工录入列。
+
+更新后的 `gemm_performance_comparison.xlsx` 包含：
+
+- 相关上下文长度和来源算子名称（相同 `M/N/K` 合并）
 - `M/N/K`
 - CUTLASS 最佳配置与 GFLOPS（脚本自动更新）
-- HGEMM（自研）最佳配置与 GFLOPS（人工筛选，已有内容会被保留）
-- HGEMM（CUDA）最佳配置与 GFLOPS（人工筛选，已有内容会被保留）
+- HGEMM（自研）GFLOPS（人工筛选，已有内容会被保留）
+- HGEMM（CUDA）GFLOPS（人工筛选，已有内容会被保留）
 - 两类 HGEMM 分别相对 CUTLASS 的加速比和人工筛选备注
 
-Excel 模板预置了 Qwen2.5-7B 的 45 个 Decode 用例。蓝色列用于粘贴脚本生成的 CUTLASS 数据；黄色和橙色列分别用于人工录入 HGEMM（自研）及 HGEMM（CUDA）结果；绿色列自动计算两者相对 CUTLASS 的加速比。
+Excel 模板预置了 Qwen2.5-7B 的 14 个唯一 Decode GEMM。蓝色列由脚本直接回填 CUTLASS 数据；黄色和橙色列分别用于人工录入 HGEMM（自研）及 HGEMM（CUDA）结果；绿色列自动计算两者相对 CUTLASS 的加速比。
 
 ## 注意事项
 
