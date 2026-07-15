@@ -164,46 +164,36 @@ Decode GEMM summary
   failed: 0
 ```
 
-## 原生与自研环境结果对比
+## CUTLASS 与 HGEMM 结果对比
 
 仓库提供：
 
 ```text
-collect_gemm_results.py           日志解析和结果合并脚本
+collect_gemm_results.py           CUTLASS 日志解析和结果回填脚本
 gemm_performance_comparison.xlsx  Excel 对比模板
 ```
 
-先在原生环境保存完整日志：
+先运行 CUTLASS 用例并保存完整日志。脚本只自动更新 CUTLASS 最佳配置和 GFLOPS：
 
 ```bash
-./run_gemm.sh --model 7b | tee native.log
+./run_gemm.sh --model 7b | tee cutlass.log
 python3 collect_gemm_results.py \
-  --environment native \
-  --log native.log \
-  --output gemm_comparison.csv
+  --log cutlass.log \
+  --output gemm_performance_comparison.csv
 ```
 
-再在自研环境保存日志，并回填同一个 CSV：
+HGEMM（自研）和 HGEMM（CUDA）数据来自其他测试程序，输出格式与 `gemm.cu` 不同，因此不由脚本解析。请按相同的上下文长度、算子和 `M/N/K` 分别人工筛选两类 HGEMM 最佳结果，再填写 Excel 模板中的人工录入列。
 
-```bash
-./run_gemm.sh --model 7b | tee custom.log
-python3 collect_gemm_results.py \
-  --environment custom \
-  --log custom.log \
-  --output gemm_comparison.csv
-```
-
-两个环境也可以只负责生成日志，然后把 `native.log` 和 `custom.log` 复制到同一台机器上执行上述两个合并命令。
-
-生成的 `gemm_comparison.csv` 包含：
+生成的 `gemm_performance_comparison.csv` 包含：
 
 - 上下文长度和算子名称
 - `M/N/K`
-- 原生最佳配置与 GFLOPS
-- 自研最佳配置与 GFLOPS
-- 自研相对原生的加速比
+- CUTLASS 最佳配置与 GFLOPS（脚本自动更新）
+- HGEMM（自研）最佳配置与 GFLOPS（人工筛选，已有内容会被保留）
+- HGEMM（CUDA）最佳配置与 GFLOPS（人工筛选，已有内容会被保留）
+- 两类 HGEMM 分别相对 CUTLASS 的加速比和人工筛选备注
 
-Excel 模板预置了 Qwen2.5-7B 的45个 Decode 用例。可将 CSV 中对应列的数据粘贴到模板的原生和自研结果列，加速比会自动计算并高亮。
+Excel 模板预置了 Qwen2.5-7B 的 45 个 Decode 用例。蓝色列用于粘贴脚本生成的 CUTLASS 数据；黄色和橙色列分别用于人工录入 HGEMM（自研）及 HGEMM（CUDA）结果；绿色列自动计算两者相对 CUTLASS 的加速比。
 
 ## 注意事项
 

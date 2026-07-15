@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse run_gemm.sh output and upsert native/custom results into one CSV table."""
+"""Parse run_gemm.sh output and update only the CUTLASS columns."""
 
 from __future__ import annotations
 
@@ -26,11 +26,27 @@ COLUMNS = [
     "m",
     "n",
     "k",
-    "native_best_config",
-    "native_gflops",
-    "custom_best_config",
-    "custom_gflops",
-    "custom_vs_native_speedup",
+    "cutlass_best_config",
+    "cutlass_gflops",
+    "hgemm_custom_best_config",
+    "hgemm_custom_gflops",
+    "hgemm_cuda_best_config",
+    "hgemm_cuda_gflops",
+    "hgemm_custom_vs_cutlass_speedup",
+    "hgemm_cuda_vs_cutlass_speedup",
+    "manual_selection_notes",
+]
+
+LEGACY_COLUMNS = [
+    "case_id", "context_length", "operation", "m", "n", "k",
+    "native_best_config", "native_gflops", "custom_best_config",
+    "custom_gflops", "custom_vs_native_speedup",
+]
+
+NV_COLUMNS = [
+    "case_id", "context_length", "operation", "m", "n", "k",
+    "nv_best_config", "nv_gflops", "custom_best_config", "custom_gflops",
+    "custom_vs_nv_speedup", "custom_selection_notes",
 ]
 
 
@@ -52,11 +68,15 @@ class ParsedResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Merge one environment's GEMM log into a native/custom comparison CSV."
+        description=(
+            "Parse CUTLASS gemm output and update the CUTLASS result columns. "
+            "HGEMM (self-developed/CUDA) results are selected and entered manually."
+        )
     )
-    parser.add_argument("--environment", required=True, choices=("native", "custom"))
     parser.add_argument("--log", required=True, type=Path)
-    parser.add_argument("--output", type=Path, default=Path("gemm_comparison.csv"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("gemm_performance_comparison.csv")
+    )
     return parser.parse_args()
 
 
@@ -107,6 +127,21 @@ def load_existing(path: Path) -> dict[str, dict[str, str]]:
         return {}
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
+        if reader.fieldnames in (LEGACY_COLUMNS, NV_COLUMNS):
+            migrated = {}
+            for old in reader:
+                row = {column: "" for column in COLUMNS}
+                row.update({key: old.get(key, "") for key in COLUMNS if key in old})
+                row["cutlass_best_config"] = old.get("nv_best_config", old.get("native_best_config", ""))
+                row["cutlass_gflops"] = old.get("nv_gflops", old.get("native_gflops", ""))
+                row["hgemm_custom_best_config"] = old.get("custom_best_config", "")
+                row["hgemm_custom_gflops"] = old.get("custom_gflops", "")
+                row["hgemm_custom_vs_cutlass_speedup"] = old.get(
+                    "custom_vs_nv_speedup", old.get("custom_vs_native_speedup", "")
+                )
+                row["manual_selection_notes"] = old.get("custom_selection_notes", "")
+                migrated[row["case_id"]] = row
+            return migrated
         if reader.fieldnames != COLUMNS:
             raise ValueError(f"Unexpected columns in {path}: {reader.fieldnames}")
         return {row["case_id"]: row for row in reader}
@@ -115,11 +150,7 @@ def load_existing(path: Path) -> dict[str, dict[str, str]]:
 def update_rows(
     rows: dict[str, dict[str, str]],
     results: list[ParsedResult],
-    environment: str,
 ) -> None:
-    config_column = f"{environment}_best_config"
-    gflops_column = f"{environment}_gflops"
-
     for result in results:
         row = rows.setdefault(result.case_id, {column: "" for column in COLUMNS})
         row.update(
@@ -130,14 +161,18 @@ def update_rows(
                 "m": str(result.m),
                 "n": str(result.n),
                 "k": str(result.k),
-                config_column: result.best_configuration,
-                gflops_column: f"{result.gflops:.4f}",
+                "cutlass_best_config": result.best_configuration,
+                "cutlass_gflops": f"{result.gflops:.4f}",
             }
         )
-        native = float(row["native_gflops"]) if row["native_gflops"] else 0.0
-        custom = float(row["custom_gflops"]) if row["custom_gflops"] else 0.0
-        row["custom_vs_native_speedup"] = (
-            f"{custom / native:.4f}" if native > 0.0 and custom > 0.0 else ""
+        cutlass = float(row["cutlass_gflops"]) if row["cutlass_gflops"] else 0.0
+        custom = float(row["hgemm_custom_gflops"]) if row["hgemm_custom_gflops"] else 0.0
+        cuda = float(row["hgemm_cuda_gflops"]) if row["hgemm_cuda_gflops"] else 0.0
+        row["hgemm_custom_vs_cutlass_speedup"] = (
+            f"{custom / cutlass:.4f}" if cutlass > 0.0 and custom > 0.0 else ""
+        )
+        row["hgemm_cuda_vs_cutlass_speedup"] = (
+            f"{cuda / cutlass:.4f}" if cutlass > 0.0 and cuda > 0.0 else ""
         )
 
 
@@ -164,14 +199,15 @@ def main() -> int:
     try:
         parsed = parse_log(args.log)
         rows = load_existing(args.output)
-        update_rows(rows, parsed, args.environment)
+        update_rows(rows, parsed)
         write_table(args.output, rows)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
     print(
-        f"Updated {len(parsed)} {args.environment} cases in {args.output.resolve()}"
+        f"Updated {len(parsed)} CUTLASS cases in {args.output.resolve()}; "
+        "HGEMM (self-developed/CUDA) columns were preserved for manual selection."
     )
     return 0
 
