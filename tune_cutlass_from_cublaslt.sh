@@ -33,7 +33,21 @@ done
 
 mkdir -p "$log_dir"
 
-# First build creates both the baseline CUTLASS executable and cuBLASLt profiler.
+# Never let a stale generated mapping break the baseline build. Preserve it as
+# a tuning artifact instead of deleting it permanently.
+generated_file="examples/gemm/cublaslt_generated_candidates.inc"
+generated_tmp="$log_dir/cublaslt_generated_candidates.inc.new"
+previous_generated="$log_dir/cublaslt_generated_candidates.inc.previous"
+failed_generated="$log_dir/cublaslt_generated_candidates.inc.failed"
+
+rm -f "$generated_tmp" "$failed_generated"
+if [[ -f "$generated_file" ]]; then
+  cp "$generated_file" "$previous_generated"
+  rm -f "$generated_file"
+fi
+
+# First build deliberately excludes generated dispatch. It creates both the
+# baseline CUTLASS executable and cuBLASLt profiler.
 ./build_gemm.sh --arch "$arch"
 
 ./run_gemm.sh --backend cublaslt --model "$model" --stage decode \
@@ -44,10 +58,19 @@ mkdir -p "$log_dir"
 python3 generate_cutlass_candidates.py \
   --log "$log_dir/cublaslt_decode.log" \
   --log "$log_dir/cublaslt_prefill.log" \
-  --output examples/gemm/cublaslt_generated_candidates.inc \
+  --output "$generated_tmp" \
   --report "$log_dir/cublaslt_cutlass_mapping.csv"
 
-# Rebuild so only generated exact-shape configurations are instantiated and used.
-./build_gemm.sh --arch "$arch"
+# Install the generated source only after generation succeeds. If its compile
+# fails, retain it for diagnosis and rebuild the baseline executable so the
+# normal build/run path remains usable.
+mv "$generated_tmp" "$generated_file"
+if ! ./build_gemm.sh --arch "$arch"; then
+  echo "Generated CUTLASS templates failed to compile; restoring baseline build." >&2
+  mv "$generated_file" "$failed_generated"
+  ./build_gemm.sh --arch "$arch"
+  echo "Failed generated source: $failed_generated" >&2
+  exit 1
+fi
 
 echo "Tuning complete. Mapping: $log_dir/cublaslt_cutlass_mapping.csv"

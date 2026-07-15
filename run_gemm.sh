@@ -2,8 +2,9 @@
 
 set -uo pipefail
 
+original_args=("$@")
 model="7b"
-stage="decode"
+stage=""
 backend="cutlass"
 iterations=20
 alpha="1.0"
@@ -29,7 +30,7 @@ Usage:
 
 Options:
   --model MODEL            0.5b, 1.5b, 3b, 7b, 14b, 32b, or 72b (default: 7b)
-  --stage STAGE            decode or prefill (default: decode)
+  --stage STAGE            all, decode, or prefill (default: all)
   --backend BACKEND        cutlass or cublaslt (default: cutlass)
   --iterations N           Timed iterations per kernel (default: 20)
   --alpha VALUE            GEMM alpha (default: 1.0)
@@ -83,6 +84,16 @@ backend="${backend,,}"
 [[ "$backend" == "cutlass" || "$backend" == "cublaslt" ]] || {
   echo "Unsupported backend: $backend (expected cutlass or cublaslt)" >&2; exit 2;
 }
+
+# With no stage (or explicit --stage all), invoke the same validated path for
+# Decode and Prefill. The appended option wins over a preceding --stage all.
+if [[ -z "$stage" || "$stage" == "all" ]]; then
+  overall_status=0
+  "$0" "${original_args[@]}" --stage decode || overall_status=$?
+  "$0" "${original_args[@]}" --stage prefill || overall_status=$?
+  exit "$overall_status"
+fi
+
 case "$stage" in
   decode)
     [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048"
@@ -90,7 +101,7 @@ case "$stage" in
   prefill)
     [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048,129,130,132,136"
     ;;
-  *) echo "Unsupported stage: $stage (expected decode or prefill)" >&2; exit 2 ;;
+  *) echo "Unsupported stage: $stage (expected all, decode, or prefill)" >&2; exit 2 ;;
 esac
 
 if ! [[ "$iterations" =~ ^[1-9][0-9]*$ && "$batch" =~ ^[1-9][0-9]*$ ]]; then
