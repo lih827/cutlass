@@ -95,12 +95,6 @@ esac
 [[ -n "$override_intermediate" ]] && intermediate="$override_intermediate"
 [[ -n "$override_vocab" ]] && vocab="$override_vocab"
 
-if ((batch * heads != 28)); then
-  echo "This GEMM binary currently supports Decode M=1 and attention M=28 only." >&2
-  echo "Selected model produces attention M=$((batch * heads))." >&2
-  exit 2
-fi
-
 if [[ -z "$executable" ]]; then
   executable="$(pwd)/examples/gemm/gemm"
 fi

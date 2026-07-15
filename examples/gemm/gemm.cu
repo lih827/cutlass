@@ -48,9 +48,7 @@ using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 constexpr int kAlignmentAM1 = 8;
 constexpr int kAlignmentBM1 = 8;
 constexpr int kAlignmentCM1 = 8;
-constexpr int kAlignmentAAttention = 4;
 constexpr int kAlignmentBAttention = 8;
-constexpr int kAlignmentCAttention = 4;
 
 template <typename LayoutA, typename LayoutB, typename LayoutC,
           int kAlignmentA, int kAlignmentB, int kAlignmentC,
@@ -161,18 +159,13 @@ struct Options {
              (k % kAlignmentBM1 == 0) &&
              (n % kAlignmentCM1 == 0);
     }
-    if (m == 28) {
-      return (m % kAlignmentAAttention == 0) &&
-             (k % kAlignmentBAttention == 0) &&
-             (m % kAlignmentCAttention == 0);
-    }
-    return false;
+    return (m % 2 == 0) && (k % kAlignmentBAttention == 0);
   }
 
   void print_usage(char const *program) const {
     std::cout
         << "Usage: " << program << " [options]\n\n"
-        << "  --m=<int>            GEMM M dimension: 1 or 28 (default: 1)\n"
+        << "  --m=<int>            GEMM M dimension (default: 1)\n"
         << "  --n=<int>            GEMM N dimension (default: 1024)\n"
         << "  --k=<int>            GEMM K dimension (default: 1024)\n"
         << "  --alpha=<float>      Epilogue alpha (default: 1.0)\n"
@@ -484,9 +477,9 @@ int main(int argc, char const **argv) {
   }
   if (!options.valid()) {
     std::cerr
-        << "Invalid problem: M must be 1 or 28. For M=1, K/N must be "
-        << "aligned to 8. For M=28, K must be aligned to 8 and the "
-        << "column-major A/C leading dimension uses alignment 4.\n";
+        << "Invalid problem: dimensions and iterations must be positive. "
+        << "K must be aligned to 8; for M=1, N must also be aligned to 8. "
+        << "Column-major M values greater than 1 must be even.\n";
     options.print_usage(argv[0]);
     return EXIT_FAILURE;
   }
@@ -518,8 +511,20 @@ int main(int argc, char const **argv) {
         LayoutAM1, LayoutBM1, LayoutCM1,
         kAlignmentAM1, kAlignmentBM1, kAlignmentCM1>(options);
   }
-  return profile_all_candidates<
-      LayoutAAttention, LayoutBAttention, LayoutCAttention,
-      kAlignmentAAttention, kAlignmentBAttention,
-      kAlignmentCAttention>(options);
+  if (options.m % 8 == 0) {
+    return profile_all_candidates<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        8, kAlignmentBAttention, 8>(options);
+  }
+  if (options.m % 4 == 0) {
+    return profile_all_candidates<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        4, kAlignmentBAttention, 4>(options);
+  }
+  if (options.m % 2 == 0) {
+    return profile_all_candidates<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        2, kAlignmentBAttention, 2>(options);
+  }
+  return EXIT_FAILURE;  // Rejected by Options::valid(); keeps dispatch exhaustive.
 }
