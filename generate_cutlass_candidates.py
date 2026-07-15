@@ -26,15 +26,12 @@ TILES = {
 
 # Legal, deliberately bounded SM80 CUTLASS CTA catalog and corresponding warp M/N.
 CATALOG = {
-    (32,32):(16,16), (32,64):(16,32), (64,32):(32,16),
-    (32,128):(16,64), (64,64):(32,32), (128,32):(64,16),
+    (32,32):(32,32), (32,64):(32,64), (64,32):(64,32),
+    (32,128):(32,64), (64,64):(32,64), (128,32):(64,32),
     (64,128):(32,64), (128,64):(64,32), (64,256):(32,64),
-    (128,128):(64,64), (256,64):(64,32), (64,512):(64,128),
-    (128,256):(64,64), (256,128):(64,64), (512,64):(128,64),
+    (128,128):(64,64), (256,64):(64,32), (64,512):(64,64),
+    (128,256):(64,64), (256,128):(64,64), (512,64):(64,64),
     (32,256):(32,64), (256,32):(64,32),
-    (64,96):(32,48), (96,64):(48,32), (96,128):(48,64),
-    (128,160):(64,80), (160,128):(80,64), (192,128):(64,64),
-    (128,192):(64,64), (128,96):(64,48),
 }
 
 
@@ -42,13 +39,27 @@ def nearest_tile(tile: tuple[int, int]) -> tuple[int, int]:
     return min(CATALOG, key=lambda t: abs(math.log2(t[0] / tile[0])) + abs(math.log2(t[1] / tile[1])))
 
 
+def validate_catalog() -> None:
+    for (tbm, tbn), (wm, wn) in CATALOG.items():
+        if tbm % wm or tbn % wn or wm < 32 or wn < 32:
+            raise ValueError(f"Illegal CUTLASS tile/warp mapping: {(tbm,tbn)} -> {(wm,wn)}")
+        warps = (tbm // wm) * (tbn // wn)
+        if not 1 <= warps <= 8:
+            raise ValueError(f"CUTLASS mapping has {warps} warps: {(tbm,tbn)} -> {(wm,wn)}")
+
+
 def stage_spec(stage_id: int) -> tuple[int, int, str]:
     if 1 <= stage_id <= 24:
-        group = (stage_id - 1) // 6
         count = ((stage_id - 1) % 6) + 1
-        # CUTLASS MmaMultistage with one buffer does not form a valid pipeline;
-        # cuBLASLt's x1 identifier is therefore represented by the legal minimum.
-        return (16 << group), max(2, count), "exact" if count >= 2 else "cutlass-min-stage-2"
+        # cuBLASLt's first stage field describes its internal stage byte/depth
+        # class, not CUTLASS ThreadblockShape::kK. Keep the verified SM80 K=32.
+        # One buffer is invalid for CUTLASS MmaMultistage and very deep pipelines
+        # can exceed shared-memory limits for large CTA tiles.
+        stages = min(4, max(2, count))
+        reason = "exact-stage-count"
+        if count < 2: reason = "cutlass-min-stage-2"
+        elif count > 4: reason = "cutlass-max-stage-4"
+        return 32, stages, reason
     return 32, 3, "fallback-stage"
 
 
@@ -75,6 +86,7 @@ def parse_log(path: Path) -> dict[tuple[int,int,int], dict[str,str]]:
 
 
 def main() -> int:
+    validate_catalog()
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", required=True, type=Path, action="append",
         help="cuBLASLt log; repeat for Decode and Prefill")
