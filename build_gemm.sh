@@ -46,6 +46,8 @@ done
 cutlass_root="$(pwd)"
 source_file="$cutlass_root/examples/gemm/gemm.cu"
 output_file="$cutlass_root/examples/gemm/gemm"
+cublaslt_source="$cutlass_root/examples/gemm/cublaslt_profiler.cu"
+cublaslt_output="$cutlass_root/examples/gemm/cublaslt_profiler"
 
 if [[ ! -f "$cutlass_root/include/cutlass/cutlass.h" ]]; then
   echo "Run this script from the CUTLASS repository root." >&2
@@ -73,3 +75,10 @@ echo "Output: $output_file"
 
 chmod +x "$output_file"
 echo "Build succeeded: $output_file"
+
+if [[ -f "$cublaslt_source" ]]; then
+  "$nvcc_command" -std=c++17 -arch="$arch" "$cublaslt_source" \
+    -lcublasLt -lcublas -o "$cublaslt_output"
+  chmod +x "$cublaslt_output"
+  echo "Build succeeded: $cublaslt_output"
+fi

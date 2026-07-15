@@ -3,11 +3,13 @@
 set -uo pipefail
 
 model="7b"
+stage="decode"
+backend="cutlass"
 iterations=20
 alpha="1.0"
 beta="0.0"
 batch=1
-lengths_csv="128,256,512,1024,2048"
+lengths_csv=""
 executable=""
 dry_run=0
 
@@ -20,18 +22,20 @@ override_vocab=""
 
 usage() {
   cat <<'EOF'
-Run all Qwen2.5 Decode GEMM cases.
+Run deduplicated Qwen2.5 Decode or Prefill GEMM cases.
 
 Usage:
   ./run_gemm.sh [options]
 
 Options:
   --model MODEL            0.5b, 1.5b, 3b, 7b, 14b, 32b, or 72b (default: 7b)
+  --stage STAGE            decode or prefill (default: decode)
+  --backend BACKEND        cutlass or cublaslt (default: cutlass)
   --iterations N           Timed iterations per kernel (default: 20)
   --alpha VALUE            GEMM alpha (default: 1.0)
   --beta VALUE             GEMM beta (default: 0.0)
-  --batch N                Decode batch size (default: 1)
-  --lengths CSV            Context lengths, e.g. 128,512,2048
+  --batch N                Batch size (default: 1)
+  --lengths CSV            Decode L or Prefill S values
   --executable PATH        GEMM executable path
   --h N                    Override hidden size
   --heads N                Override attention head count
@@ -54,6 +58,8 @@ require_value() {
 while (($# > 0)); do
   case "$1" in
     --model)        require_value "$@"; model="$2"; shift 2 ;;
+    --stage)        require_value "$@"; stage="$2"; shift 2 ;;
+    --backend)      require_value "$@"; backend="$2"; shift 2 ;;
     --iterations)   require_value "$@"; iterations="$2"; shift 2 ;;
     --alpha)        require_value "$@"; alpha="$2"; shift 2 ;;
     --beta)         require_value "$@"; beta="$2"; shift 2 ;;
@@ -71,6 +77,21 @@ while (($# > 0)); do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+stage="${stage,,}"
+backend="${backend,,}"
+[[ "$backend" == "cutlass" || "$backend" == "cublaslt" ]] || {
+  echo "Unsupported backend: $backend (expected cutlass or cublaslt)" >&2; exit 2;
+}
+case "$stage" in
+  decode)
+    [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048"
+    ;;
+  prefill)
+    [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048,129,130,132,136"
+    ;;
+  *) echo "Unsupported stage: $stage (expected decode or prefill)" >&2; exit 2 ;;
+esac
 
 if ! [[ "$iterations" =~ ^[1-9][0-9]*$ && "$batch" =~ ^[1-9][0-9]*$ ]]; then
   echo "iterations and batch must be positive integers" >&2
@@ -96,7 +117,11 @@ esac
 [[ -n "$override_vocab" ]] && vocab="$override_vocab"
 
 if [[ -z "$executable" ]]; then
-  executable="$(pwd)/examples/gemm/gemm"
+  if [[ "$backend" == "cublaslt" ]]; then
+    executable="$(pwd)/examples/gemm/cublaslt_profiler"
+  else
+    executable="$(pwd)/examples/gemm/gemm"
+  fi
 fi
 
 if ((dry_run == 0)) && [[ ! -x "$executable" ]]; then
@@ -118,7 +143,7 @@ attention_operations=("Attention QK^T" "Attention AV")
 
 for length in "${lengths[@]}"; do
   if ! [[ "$length" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Invalid context length: $length" >&2
+    echo "Invalid sequence length: $length" >&2
     exit 2
   fi
 done
@@ -138,6 +163,25 @@ shape_for_decode_op() {
     "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate)); k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                     k=$intermediate ;;
     "LM Head")        m=$token_m;     n=$vocab;                 k=$h ;;
+    *) echo "Unsupported operation: $operation" >&2; return 2 ;;
+  esac
+}
+
+shape_for_prefill_op() {
+  local operation="$1"
+  local sequence_length="$2"
+  local token_m=$((batch * sequence_length))
+  local attention_m=$((batch * heads * sequence_length))
+
+  case "$operation" in
+    "Q")              m=$token_m;     n=$h;                      k=$h ;;
+    "K"|"V")         m=$token_m;     n=$((kv_heads * head_dim)); k=$h ;;
+    "Attention QK^T") m=$attention_m; n=$sequence_length;        k=$head_dim ;;
+    "Attention AV")   m=$attention_m; n=$head_dim;               k=$sequence_length ;;
+    "Attention Out")  m=$token_m;     n=$h;                      k=$h ;;
+    "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate));   k=$h ;;
+    "MLP Down")       m=$token_m;     n=$h;                      k=$intermediate ;;
+    "LM Head")        m=$token_m;     n=$vocab;                  k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
   esac
 }
@@ -171,28 +215,40 @@ add_unique_case() {
   case_lengths[$slot]="$context_length"
 }
 
-# L does not affect these GEMMs. Generate them once, then merge equal M/N/K
-# shapes such as Q/Attention Out and K/V.
-for operation in "${base_operations[@]}"; do
-  shape_for_decode_op "$operation" 1
-  add_unique_case "$operation" "-"
-done
-
-# Only attention GEMMs depend on decode context length L.
-for context_length in "${lengths[@]}"; do
-  for operation in "${attention_operations[@]}"; do
-    shape_for_decode_op "$operation" "$context_length"
-    add_unique_case "$operation" "$context_length"
+if [[ "$stage" == "decode" ]]; then
+  # L does not affect these GEMMs. Generate them once, then merge equal M/N/K
+  # shapes such as Q/Attention Out and K/V.
+  for operation in "${base_operations[@]}"; do
+    shape_for_decode_op "$operation" 1
+    add_unique_case "$operation" "-"
   done
-done
+
+  # Only attention GEMMs depend on decode context length L.
+  for context_length in "${lengths[@]}"; do
+    for operation in "${attention_operations[@]}"; do
+      shape_for_decode_op "$operation" "$context_length"
+      add_unique_case "$operation" "$context_length"
+    done
+  done
+else
+  # In Prefill, S participates in token M and attention M/N/K.
+  for sequence_length in "${lengths[@]}"; do
+    for operation in "${base_operations[@]}" "${attention_operations[@]}"; do
+      shape_for_prefill_op "$operation" "$sequence_length"
+      add_unique_case "$operation" "$sequence_length"
+    done
+  done
+fi
 
 total_cases=${#case_m[@]}
 failed_cases=0
 case_index=0
 
 echo "Model: Qwen2.5-$model"
+echo "Stage: ${stage^}"
+echo "Backend: $backend"
 echo "Parameters: H=$h, heads=$heads, kv_heads=$kv_heads, head_dim=$head_dim, intermediate=$intermediate, vocab=$vocab, batch=$batch"
-echo "Decode lengths: ${lengths[*]}"
+echo "Sequence lengths: ${lengths[*]}"
 echo "Unique GEMM cases (deduplicated by M/N/K): $total_cases"
 
 for slot in "${!case_m[@]}"; do
@@ -202,18 +258,13 @@ for slot in "${!case_m[@]}"; do
     k=${case_k[$slot]}
     operations_label=${case_operations[$slot]}
     lengths_label=${case_lengths[$slot]}
-    command=(
-      "$executable"
-      "--m=$m"
-      "--n=$n"
-      "--k=$k"
-      "--alpha=$alpha"
-      "--beta=$beta"
-      "--iterations=$iterations"
-    )
+    command=("$executable" "--m=$m" "--n=$n" "--k=$k" "--iterations=$iterations")
+    if [[ "$backend" == "cutlass" ]]; then
+      command+=("--alpha=$alpha" "--beta=$beta")
+    fi
 
-    printf '\n[%d/%d] L=%s ops=%s MxNxK=%dx%dx%d\n' \
-      "$case_index" "$total_cases" "$lengths_label" "$operations_label" "$m" "$n" "$k"
+    printf '\n[%d/%d] stage=%s length=%s ops=%s MxNxK=%dx%dx%d\n' \
+      "$case_index" "$total_cases" "${stage^}" "$lengths_label" "$operations_label" "$m" "$n" "$k"
     printf 'Command:'
     printf ' %q' "${command[@]}"
     printf '\n'
@@ -226,11 +277,11 @@ for slot in "${!case_m[@]}"; do
     exit_code=$?
     if ((exit_code != 0)); then
       ((failed_cases += 1))
-      echo "FAILED: exit_code=$exit_code L=$lengths_label ops=$operations_label MxNxK=${m}x${n}x${k}" >&2
+      echo "FAILED: exit_code=$exit_code stage=${stage^} length=$lengths_label ops=$operations_label MxNxK=${m}x${n}x${k}" >&2
     fi
 done
 
-printf '\nDecode GEMM summary\n'
+printf '\n%s GEMM summary\n' "${stage^}"
 echo "  total: $total_cases"
 if ((dry_run == 1)); then
   echo "  dry-run: commands generated but not executed"

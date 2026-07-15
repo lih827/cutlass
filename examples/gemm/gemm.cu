@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -89,6 +90,32 @@ using AttentionAVStreamKGemm = GemmConfiguration<
     cutlass::gemm::GemmShape<16, 64, 32>,
     cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 4>;
 
+// Prefill candidates: large M/N grids already provide abundant parallelism,
+// so use larger CTA tiles and the identity swizzle.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM128x128Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM128x256Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<128, 256, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM256x128Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<256, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
 template <typename T>
 struct ConfigName {
   static char const *value() { return "unknown"; }
@@ -138,6 +165,7 @@ struct Options {
   float alpha = 1.0f;
   float beta = 0.0f;
   int iterations = 20;
+  int split_k_slices = 1;  // Set by generated cuBLASLt-derived dispatch.
 
   void parse(int argc, char const **argv) {
     cutlass::CommandLine cmd(argc, argv);
@@ -159,7 +187,7 @@ struct Options {
              (k % kAlignmentBM1 == 0) &&
              (n % kAlignmentCM1 == 0);
     }
-    return (m % 2 == 0) && (k % kAlignmentBAttention == 0);
+    return true;  // Non-aligned M/K use the Alignment=1 synchronous fallback.
   }
 
   void print_usage(char const *program) const {
@@ -256,7 +284,7 @@ struct ArgumentFactory {
     return typename Gemm::Arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
-        1,
+        options.split_k_slices,
         {ElementCompute(options.alpha), ElementCompute(options.beta)},
         tensors.a.device_data(), tensors.b.device_data(),
         tensors.c.device_data(), tensors.d.device_data(),
@@ -277,7 +305,7 @@ struct ArgumentFactory<
     return typename Gemm::Arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
-        1,
+        options.split_k_slices,
         {ElementCompute(options.alpha), ElementCompute(options.beta)},
         tensors.a.device_data(), tensors.b.device_data(),
         tensors.c.device_data(), tensors.d.device_data(),
@@ -359,6 +387,7 @@ void print_configuration(char const *configuration_name, Options const &options)
       << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
       << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
       << "  iterations: " << options.iterations << "\n"
+      << "  split-K slices: " << options.split_k_slices << "\n"
       << "  A: " << ConfigName<ElementA>::value() << ", "
       << ConfigName<typename Gemm::LayoutA>::value() << "\n"
       << "  B: " << ConfigName<ElementB>::value() << ", "
@@ -459,6 +488,100 @@ int profile_all_candidates(Options const &options) {
   return EXIT_SUCCESS;
 }
 
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+int profile_large_m_candidates(Options const &options) {
+  using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
+  using Tile128x128 = LargeM128x128Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Tile128x256 = LargeM128x256Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Tile256x128 = LargeM256x128Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+
+  TensorSet tensors;
+  if (!initialize_tensors(options, tensors) ||
+      !compute_reference(options, tensors)) {
+    return EXIT_FAILURE;
+  }
+
+  print_configuration<Tile128x128>("Large-M 128x128", options);
+  Result tile_128x128 = run_tensorop_gemm<Tile128x128>(options, tensors);
+  print_result("Large-M 128x128", tile_128x128);
+
+  print_configuration<Tile128x256>("Large-M 128x256", options);
+  Result tile_128x256 = run_tensorop_gemm<Tile128x256>(options, tensors);
+  print_result("Large-M 128x256", tile_128x256);
+
+  print_configuration<Tile256x128>("Large-M 256x128", options);
+  Result tile_256x128 = run_tensorop_gemm<Tile256x128>(options, tensors);
+  print_result("Large-M 256x128", tile_256x128);
+
+  char const *best_configuration_name = nullptr;
+  Result const *best_result = nullptr;
+  auto consider = [&](char const *name, Result const &candidate) {
+    if (candidate.status == cutlass::Status::kSuccess && candidate.passed &&
+        (!best_result || candidate.avg_time_ms < best_result->avg_time_ms)) {
+      best_configuration_name = name;
+      best_result = &candidate;
+    }
+  };
+  consider("Large-M 128x128", tile_128x128);
+  consider("Large-M 128x256", tile_128x256);
+  consider("Large-M 256x128", tile_256x128);
+
+  if (!best_result) {
+    std::cerr << "\nNo large-M candidate completed successfully and passed verification.\n";
+    return EXIT_FAILURE;
+  }
+
+  std::cout << "\nBest configuration: " << best_configuration_name << "\n"
+            << "  avg_time: " << best_result->avg_time_ms << " ms\n"
+            << "  gflops: " << best_result->gflops << "\n";
+  return EXIT_SUCCESS;
+}
+
+// Runs one template generated from the locally measured cuBLASLt winner.
+// The generated header only instantiates configurations referenced by the
+// current Decode/Prefill shape set, keeping the CUTLASS compile search small.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC,
+          typename ThreadblockShape, typename WarpShape, int kStages>
+int profile_cublaslt_template(char const *name, int split_k_slices,
+                              Options const &options) {
+  using Gemm = GemmConfiguration<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+      ThreadblockShape, WarpShape,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+  using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
+  Options tuned_options = options;
+  tuned_options.split_k_slices = std::max(1, split_k_slices);
+  TensorSet tensors;
+  if (!initialize_tensors(tuned_options, tensors) || !compute_reference(tuned_options, tensors)) {
+    return -1;
+  }
+  print_configuration<Gemm>(name, tuned_options);
+  Result result = run_tensorop_gemm<Gemm>(tuned_options, tensors);
+  print_result(name, result);
+  if (result.status != cutlass::Status::kSuccess || !result.passed) {
+    std::cerr << "Generated cuBLASLt-derived template was not runnable; "
+                 "falling back to the baseline candidates.\n";
+    return -1;
+  }
+  std::cout << "\nBest configuration: " << name << "\n"
+            << "  avg_time: " << result.avg_time_ms << " ms\n"
+            << "  gflops: " << result.gflops << "\n";
+  return EXIT_SUCCESS;
+}
+
+#if __has_include("cublaslt_generated_candidates.inc")
+#include "cublaslt_generated_candidates.inc"
+#else
+int profile_cublaslt_generated_candidate(Options const &) {
+  return -1;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char const **argv) {
@@ -478,8 +601,7 @@ int main(int argc, char const **argv) {
   if (!options.valid()) {
     std::cerr
         << "Invalid problem: dimensions and iterations must be positive. "
-        << "K must be aligned to 8; for M=1, N must also be aligned to 8. "
-        << "Column-major M values greater than 1 must be even.\n";
+        << "For M=1, K and N must be aligned to 8.\n";
     options.print_usage(argv[0]);
     return EXIT_FAILURE;
   }
@@ -505,11 +627,36 @@ int main(int argc, char const **argv) {
     return EXIT_FAILURE;
   }
 
+  // A generated exact-shape template takes precedence. A return value of -1
+  // means no local cuBLASLt mapping exists and preserves the baseline search.
+  int generated_status = profile_cublaslt_generated_candidate(options);
+  if (generated_status != -1) {
+    return generated_status;
+  }
+
   // Step 4: select the physical layout used by the cuBLAS comparison.
   if (options.m == 1) {
     return profile_all_candidates<
         LayoutAM1, LayoutBM1, LayoutCM1,
         kAlignmentAM1, kAlignmentBM1, kAlignmentCM1>(options);
+  }
+  if (options.m >= 128) {
+    if (options.m % 8 == 0 && options.k % 8 == 0) {
+      return profile_large_m_candidates<
+          LayoutAAttention, LayoutBAttention, LayoutCAttention,
+          8, 8, 8, 3>(options);
+    }
+    // FP16 Alignment=1 is a 2-byte access, which is unsupported by cp.async.
+    // Stages=2 selects CUTLASS's synchronous MmaPipelined mainloop, so the
+    // original (unpadded) dimensions can be processed with scalar accesses.
+    return profile_large_m_candidates<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        1, 1, 1, 2>(options);
+  }
+  if (options.m % 2 != 0 || options.k % 8 != 0) {
+    return profile_large_m_candidates<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        1, 1, 1, 2>(options);
   }
   if (options.m % 8 == 0) {
     return profile_all_candidates<
@@ -526,5 +673,5 @@ int main(int argc, char const **argv) {
         LayoutAAttention, LayoutBAttention, LayoutCAttention,
         2, kAlignmentBAttention, 2>(options);
   }
-  return EXIT_FAILURE;  // Rejected by Options::valid(); keeps dispatch exhaustive.
+  return EXIT_FAILURE;
 }

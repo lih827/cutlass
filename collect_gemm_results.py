@@ -17,12 +17,18 @@ except ImportError:  # pragma: no cover - depends on the target Linux environmen
 
 CASE_RE = re.compile(
     r"^\[(?P<index>\d+)/(?P<total>\d+)\]\s+"
-    r"L=(?P<context_lengths>\S+)\s+ops=(?P<source_operations>.+?)\s+"
+    r"stage=(?P<stage>Decode|Prefill)\s+length=(?P<lengths>\S+)\s+"
+    r"ops=(?P<source_operations>.+?)\s+"
+    r"MxNxK=(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)\s*$"
+)
+DEDUP_LEGACY_CASE_RE = re.compile(
+    r"^\[(?P<index>\d+)/(?P<total>\d+)\]\s+"
+    r"L=(?P<lengths>\S+)\s+ops=(?P<source_operations>.+?)\s+"
     r"MxNxK=(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)\s*$"
 )
 LEGACY_CASE_RE = re.compile(
     r"^\[(?P<index>\d+)/(?P<total>\d+)\]\s+"
-    r"L=(?P<context_lengths>\d+)\s+op=(?P<source_operations>.+?)\s+"
+    r"L=(?P<lengths>\d+)\s+op=(?P<source_operations>.+?)\s+"
     r"MxNxK=(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)\s*$"
 )
 BEST_RE = re.compile(r"^Best configuration:\s*(?P<configuration>.+?)\s*$")
@@ -35,7 +41,7 @@ FIRST_DATA_ROW = 6
 
 @dataclass(frozen=True)
 class ParsedResult:
-    context_lengths: str
+    sequence_label: str
     source_operations: str
     m: int
     n: int
@@ -78,7 +84,11 @@ def parse_log(path: Path) -> list[ParsedResult]:
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for raw_line in stream:
             line = raw_line.rstrip("\r\n")
-            case_match = CASE_RE.match(line) or LEGACY_CASE_RE.match(line)
+            case_match = (
+                CASE_RE.match(line)
+                or DEDUP_LEGACY_CASE_RE.match(line)
+                or LEGACY_CASE_RE.match(line)
+            )
             if case_match:
                 current_case = case_match.groupdict()
                 pending_configuration = None
@@ -91,8 +101,10 @@ def parse_log(path: Path) -> list[ParsedResult]:
 
             gflops_match = GFLOPS_RE.match(line)
             if gflops_match and current_case and pending_configuration:
+                stage = current_case.get("stage") or "Decode"
+                axis = "L" if stage == "Decode" else "S"
                 result = ParsedResult(
-                    context_lengths=current_case["context_lengths"],
+                    sequence_label=f"{stage} {axis}={current_case['lengths']}",
                     source_operations=current_case["source_operations"],
                     m=int(current_case["m"]),
                     n=int(current_case["n"]),
@@ -162,7 +174,7 @@ def update_workbook(template: Path, output: Path, results: list[ParsedResult]) -
 
     for result in results:
         row = shape_rows[result.shape]
-        sheet.cell(row, 1).value = result.context_lengths
+        sheet.cell(row, 1).value = result.sequence_label
         sheet.cell(row, 2).value = result.source_operations
         sheet.cell(row, 6).value = result.best_configuration
         sheet.cell(row, 7).value = result.gflops
