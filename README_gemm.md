@@ -72,6 +72,15 @@ chmod +x build_gemm.sh run_gemm.sh
 ./build_gemm.sh --arch sm_89
 ```
 
+默认版本打印所有候选配置及其结果。若只需要最终胜出的完整配置、Status、avg_time 和 GFLOPS，可使用编译期开关：
+
+```bash
+./build_gemm.sh --arch sm_89 --concise-log
+./run_gemm.sh --model 7b
+```
+
+精简日志仍会在内部执行所有 CUTLASS 候选以及命中的 cuBLASLt 派生候选，只抑制非最佳项的输出，不会改变选优过程。要恢复完整日志，重新执行不带 `--concise-log` 的 build。
+
 指定 `nvcc` 路径：
 
 ```bash
@@ -101,7 +110,7 @@ chmod +x tune_cutlass_from_cublaslt.sh
 3. 记录每个 shape 的最优 Algo ID、Tile、Stages、Split-K、Swizzle 和 workspace。
 4. 运行 `generate_cutlass_candidates.py`，把 cuBLASLt Tile/Stages 转换成合法的 SM80 CUTLASS Threadblock/Warp 模板。
 5. 对现有候选没有覆盖的合法 Tile 自动新增模板，并重新编译 `gemm`。
-6. 后续运行命中同一 `M/N/K` 时只执行生成的模板；没有映射的 shape 自动回退到原有候选比较。
+6. 后续运行命中同一 `M/N/K` 时，把生成模板与 CUTLASS 自身候选一起实测比较并输出真正的最佳项；没有映射的 shape 只比较 CUTLASS 自身候选。
 
 `cublaslt_generated_candidates.inc` 是可选文件。文件尚未生成或被删除时，`gemm.cu` 仍可正常编译，`run_gemm.sh` 会使用原有候选集合；执行调优脚本后才启用精确 shape 映射。
 
@@ -118,7 +127,8 @@ cublaslt_tuning/cublaslt_cutlass_mapping.csv
 
 cuBLASLt 的 Tile/Stages 不是 CUTLASS 模板的完整描述。生成器遵循以下约束：
 
-- Tile 在合法目录中存在时精确采用；现有三候选未覆盖但可合法构造的 Tile 会新增 CUTLASS 模板；其余情况选择最近的合法 TensorOp Tile，并在 CSV 中标记 `tile_mapping`。
+- `.inc` 在每个 shape 前保留原始 cuBLASLt Algo ID、Tile ID/尺寸、Stages ID、Split-K、Reduction、Swizzle、Workspace，仅供追溯参考；其后保存实际参与编译的 CUTLASS 映射。
+- Tile 在合法目录中存在时精确采用；现有候选未覆盖但可合法构造的 Tile 会新增 CUTLASS 模板；其余情况选择最近的合法 TensorOp Tile，并在 CSV 中标记 `tile_mapping`。
 - cuBLASLt 单缓冲 Stages 会提升为 CUTLASS 合法的最小 Stages 2。
 - 自动生成仅使用已经通过 SM80 编译检查的 WarpShape（每个维度至少 32、每个 CTA 不超过 8 个 warp）；非常规 cuBLASLt Tile 会映射到最近的安全 CUTLASS Tile。
 - Threadblock K 固定为已验证的 32；cuBLASLt 的内部 stage-size 不直接当作 CUTLASS Threadblock K。Stages 限制在 2～4，以避免非法单缓冲或过大的共享内存配置。
@@ -170,12 +180,15 @@ Prefill 默认序列长度为：
 
 Prefill 中所有算子的形状都会随 `S` 变化。Qwen2.5-7B 去重后包含 62 个唯一 GEMM；同一 `S` 下的 `Q / Attention Out`、`K / V` 以及相同形状的 Attention 算子会合并记录。
 
-大 M Prefill 会比较三组配置：
+大 M Prefill 默认比较六组安全配置：
 
 ```text
 128x128x32，Warp 64x64x32
 128x256x32，Warp 64x64x32
 256x128x32，Warp 64x64x32
+64x128x32，Warp 32x64x32
+128x64x32，Warp 64x32x32
+64x256x32，Warp 32x64x32
 ```
 
 M、K 都能被 8 整除时使用 Alignment A/B/C `8/8/8` 和 Stages 3；否则不做 padding，改用 Alignment `1/1/1`、Stages 2 的同步双缓冲 fallback。

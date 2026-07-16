@@ -28,6 +28,12 @@
 
 namespace {
 
+#if defined(GEMM_CONCISE_LOG) && GEMM_CONCISE_LOG
+constexpr bool kConciseLog = true;
+#else
+constexpr bool kConciseLog = false;
+#endif
+
 using ElementA = cutlass::half_t;
 using ElementB = cutlass::half_t;
 using ElementC = cutlass::half_t;
@@ -114,6 +120,30 @@ using LargeM256x128Gemm = GemmConfiguration<
     LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
     cutlass::gemm::GemmShape<256, 128, 32>,
     cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM64x128Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<64, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM128x64Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<128, 64, 32>,
+    cutlass::gemm::GemmShape<64, 32, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using LargeM64x256Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<64, 256, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
 
 template <typename T>
@@ -222,6 +252,18 @@ struct Result {
   double gflops = 0.0;
   bool passed = false;
 };
+
+struct GeneratedCandidateResult {
+  bool available = false;
+  std::string name;
+  Result result;
+  int threadblock_m = 0, threadblock_n = 0, threadblock_k = 0;
+  int warp_m = 0, warp_n = 0, warp_k = 0;
+  int stages = 0, alignment_a = 0, alignment_b = 0, alignment_c = 0;
+  int split_k_slices = 1;
+};
+
+GeneratedCandidateResult generated_candidate_result;
 
 #define CUDA_RETURN_IF_ERROR(expr)                                                       \
   do {                                                                                   \
@@ -431,6 +473,26 @@ void print_result(char const *configuration_name, Result const &result) {
             << "  gflops: " << result.gflops << "\n";
 }
 
+void print_generated_configuration(Options const &options) {
+  auto const &g = generated_candidate_result;
+  std::cout << "\nGEMM configuration: " << g.name << "\n"
+            << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
+            << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
+            << "  iterations: " << options.iterations << "\n"
+            << "  split-K slices: " << g.split_k_slices << "\n"
+            << "  A: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
+            << "  B: half, column-major\n"
+            << "  C: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
+            << "  accumulator: half\n"
+            << "  operator class / arch: OpClassTensorOp / Sm80\n"
+            << "  threadblock: " << g.threadblock_m << "x" << g.threadblock_n << "x" << g.threadblock_k << "\n"
+            << "  warp: " << g.warp_m << "x" << g.warp_n << "x" << g.warp_k << "\n"
+            << "  instruction: 16x8x16\n"
+            << "  alignment A/B/C: " << g.alignment_a << " / " << g.alignment_b << " / " << g.alignment_c << "\n"
+            << "  stages: " << g.stages << "\n"
+            << "  threadblock swizzle: Identity\n";
+}
+
 template <typename LayoutA, typename LayoutB, typename LayoutC,
           int kAlignmentA, int kAlignmentB, int kAlignmentC>
 int profile_all_candidates(Options const &options) {
@@ -448,38 +510,67 @@ int profile_all_candidates(Options const &options) {
     return EXIT_FAILURE;
   }
 
-  print_configuration<Linear>("Linear", options);
+  if (!kConciseLog) print_configuration<Linear>("Linear", options);
   Result linear = run_tensorop_gemm<Linear>(options, tensors);
-  print_result("Linear", linear);
+  if (!kConciseLog) print_result("Linear", linear);
 
-  print_configuration<AttentionQK>("Attention QK^T", options);
+  if (!kConciseLog) print_configuration<AttentionQK>("Attention QK^T", options);
   Result attention_qk = run_tensorop_gemm<AttentionQK>(options, tensors);
-  print_result("Attention QK^T", attention_qk);
+  if (!kConciseLog) print_result("Attention QK^T", attention_qk);
 
-  print_configuration<AttentionAV>("Attention AV Stream-K", options);
+  if (!kConciseLog) print_configuration<AttentionAV>("Attention AV Stream-K", options);
   Result attention_av = run_tensorop_gemm<AttentionAV>(options, tensors);
-  print_result("Attention AV Stream-K", attention_av);
+  if (!kConciseLog) print_result("Attention AV Stream-K", attention_av);
 
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
+  bool best_is_generated = false;
+  if (generated_candidate_result.available &&
+      generated_candidate_result.result.status == cutlass::Status::kSuccess &&
+      generated_candidate_result.result.passed) {
+    best_configuration_name = generated_candidate_result.name.c_str();
+    best_result = &generated_candidate_result.result;
+    best_is_generated = true;
+  }
   if (linear.status == cutlass::Status::kSuccess && linear.passed) {
-    best_configuration_name = "Linear";
-    best_result = &linear;
+    if (!best_result || linear.avg_time_ms < best_result->avg_time_ms) {
+      best_configuration_name = "Linear";
+      best_result = &linear;
+      best_is_generated = false;
+    }
   }
   if (attention_qk.status == cutlass::Status::kSuccess && attention_qk.passed &&
       (!best_result || attention_qk.avg_time_ms < best_result->avg_time_ms)) {
     best_configuration_name = "Attention QK^T";
     best_result = &attention_qk;
+    best_is_generated = false;
   }
   if (attention_av.status == cutlass::Status::kSuccess && attention_av.passed &&
       (!best_result || attention_av.avg_time_ms < best_result->avg_time_ms)) {
     best_configuration_name = "Attention AV Stream-K";
     best_result = &attention_av;
+    best_is_generated = false;
   }
 
   if (!best_result) {
     std::cerr << "\nNo candidate completed successfully and passed verification.\n";
     return EXIT_FAILURE;
+  }
+
+  if (kConciseLog) {
+    if (best_is_generated) {
+      print_generated_configuration(options);
+      print_result(best_configuration_name, *best_result);
+    } else if (best_result == &linear) {
+      print_configuration<Linear>(best_configuration_name, options);
+      print_result(best_configuration_name, *best_result);
+    } else if (best_result == &attention_qk) {
+      print_configuration<AttentionQK>(best_configuration_name, options);
+      print_result(best_configuration_name, *best_result);
+    } else {
+      print_configuration<AttentionAV>(best_configuration_name, options);
+      print_result(best_configuration_name, *best_result);
+    }
   }
 
   std::cout << "\nBest configuration: " << best_configuration_name << "\n"
@@ -498,6 +589,12 @@ int profile_large_m_candidates(Options const &options) {
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
   using Tile256x128 = LargeM256x128Gemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Tile64x128 = LargeM64x128Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Tile128x64 = LargeM128x64Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Tile64x256 = LargeM64x256Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
@@ -505,34 +602,77 @@ int profile_large_m_candidates(Options const &options) {
     return EXIT_FAILURE;
   }
 
-  print_configuration<Tile128x128>("Large-M 128x128", options);
+  if (!kConciseLog) print_configuration<Tile128x128>("Large-M 128x128", options);
   Result tile_128x128 = run_tensorop_gemm<Tile128x128>(options, tensors);
-  print_result("Large-M 128x128", tile_128x128);
+  if (!kConciseLog) print_result("Large-M 128x128", tile_128x128);
 
-  print_configuration<Tile128x256>("Large-M 128x256", options);
+  if (!kConciseLog) print_configuration<Tile128x256>("Large-M 128x256", options);
   Result tile_128x256 = run_tensorop_gemm<Tile128x256>(options, tensors);
-  print_result("Large-M 128x256", tile_128x256);
+  if (!kConciseLog) print_result("Large-M 128x256", tile_128x256);
 
-  print_configuration<Tile256x128>("Large-M 256x128", options);
+  if (!kConciseLog) print_configuration<Tile256x128>("Large-M 256x128", options);
   Result tile_256x128 = run_tensorop_gemm<Tile256x128>(options, tensors);
-  print_result("Large-M 256x128", tile_256x128);
+  if (!kConciseLog) print_result("Large-M 256x128", tile_256x128);
+
+  if (!kConciseLog) print_configuration<Tile64x128>("Large-M 64x128", options);
+  Result tile_64x128 = run_tensorop_gemm<Tile64x128>(options, tensors);
+  if (!kConciseLog) print_result("Large-M 64x128", tile_64x128);
+
+  if (!kConciseLog) print_configuration<Tile128x64>("Large-M 128x64", options);
+  Result tile_128x64 = run_tensorop_gemm<Tile128x64>(options, tensors);
+  if (!kConciseLog) print_result("Large-M 128x64", tile_128x64);
+
+  if (!kConciseLog) print_configuration<Tile64x256>("Large-M 64x256", options);
+  Result tile_64x256 = run_tensorop_gemm<Tile64x256>(options, tensors);
+  if (!kConciseLog) print_result("Large-M 64x256", tile_64x256);
 
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
+  bool best_is_generated = false;
   auto consider = [&](char const *name, Result const &candidate) {
     if (candidate.status == cutlass::Status::kSuccess && candidate.passed &&
         (!best_result || candidate.avg_time_ms < best_result->avg_time_ms)) {
       best_configuration_name = name;
       best_result = &candidate;
+      best_is_generated = false;
     }
   };
+  if (generated_candidate_result.available &&
+      generated_candidate_result.result.status == cutlass::Status::kSuccess &&
+      generated_candidate_result.result.passed) {
+    best_configuration_name = generated_candidate_result.name.c_str();
+    best_result = &generated_candidate_result.result;
+    best_is_generated = true;
+  }
   consider("Large-M 128x128", tile_128x128);
   consider("Large-M 128x256", tile_128x256);
   consider("Large-M 256x128", tile_256x128);
+  consider("Large-M 64x128", tile_64x128);
+  consider("Large-M 128x64", tile_128x64);
+  consider("Large-M 64x256", tile_64x256);
 
   if (!best_result) {
     std::cerr << "\nNo large-M candidate completed successfully and passed verification.\n";
     return EXIT_FAILURE;
+  }
+
+  if (kConciseLog) {
+    if (best_is_generated) {
+      print_generated_configuration(options);
+    } else if (best_result == &tile_128x128) {
+      print_configuration<Tile128x128>(best_configuration_name, options);
+    } else if (best_result == &tile_128x256) {
+      print_configuration<Tile128x256>(best_configuration_name, options);
+    } else if (best_result == &tile_256x128) {
+      print_configuration<Tile256x128>(best_configuration_name, options);
+    } else if (best_result == &tile_64x128) {
+      print_configuration<Tile64x128>(best_configuration_name, options);
+    } else if (best_result == &tile_128x64) {
+      print_configuration<Tile128x64>(best_configuration_name, options);
+    } else {
+      print_configuration<Tile64x256>(best_configuration_name, options);
+    }
+    print_result(best_configuration_name, *best_result);
   }
 
   std::cout << "\nBest configuration: " << best_configuration_name << "\n"
@@ -560,18 +700,29 @@ int profile_cublaslt_template(char const *name, int split_k_slices,
   if (!initialize_tensors(tuned_options, tensors) || !compute_reference(tuned_options, tensors)) {
     return -1;
   }
-  print_configuration<Gemm>(name, tuned_options);
+  if (!kConciseLog) print_configuration<Gemm>(name, tuned_options);
   Result result = run_tensorop_gemm<Gemm>(tuned_options, tensors);
-  print_result(name, result);
+  if (!kConciseLog) print_result(name, result);
   if (result.status != cutlass::Status::kSuccess || !result.passed) {
     std::cerr << "Generated cuBLASLt-derived template was not runnable; "
                  "falling back to the baseline candidates.\n";
     return -1;
   }
-  std::cout << "\nBest configuration: " << name << "\n"
-            << "  avg_time: " << result.avg_time_ms << " ms\n"
-            << "  gflops: " << result.gflops << "\n";
-  return EXIT_SUCCESS;
+  generated_candidate_result.available = true;
+  generated_candidate_result.name = name;
+  generated_candidate_result.result = result;
+  generated_candidate_result.threadblock_m = ThreadblockShape::kM;
+  generated_candidate_result.threadblock_n = ThreadblockShape::kN;
+  generated_candidate_result.threadblock_k = ThreadblockShape::kK;
+  generated_candidate_result.warp_m = WarpShape::kM;
+  generated_candidate_result.warp_n = WarpShape::kN;
+  generated_candidate_result.warp_k = WarpShape::kK;
+  generated_candidate_result.stages = kStages;
+  generated_candidate_result.alignment_a = kAlignmentA;
+  generated_candidate_result.alignment_b = kAlignmentB;
+  generated_candidate_result.alignment_c = kAlignmentC;
+  generated_candidate_result.split_k_slices = tuned_options.split_k_slices;
+  return -1;  // Always continue into the CUTLASS baseline candidate comparison.
 }
 
 #if __has_include("cublaslt_generated_candidates.inc")
@@ -629,10 +780,7 @@ int main(int argc, char const **argv) {
 
   // A generated exact-shape template takes precedence. A return value of -1
   // means no local cuBLASLt mapping exists and preserves the baseline search.
-  int generated_status = profile_cublaslt_generated_candidate(options);
-  if (generated_status != -1) {
-    return generated_status;
-  }
+  profile_cublaslt_generated_candidate(options);
 
   // Step 4: select the physical layout used by the cuBLAS comparison.
   if (options.m == 1) {

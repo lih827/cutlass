@@ -4,6 +4,7 @@ set -euo pipefail
 
 arch="sm_89"
 nvcc_command="${NVCC:-nvcc}"
+concise_log=0
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,7 @@ Usage:
 Options:
   --arch ARCH       CUDA architecture, for example sm_80 or sm_89 (default: sm_89)
   --nvcc PATH       nvcc executable (default: $NVCC or nvcc)
+  --concise-log     Compile gemm to print only the winning candidate details
   --help            Show this help
 EOF
 }
@@ -30,6 +32,10 @@ while (($# > 0)); do
       [[ $# -ge 2 ]] || { echo "Missing value for --nvcc" >&2; exit 2; }
       nvcc_command="$2"
       shift 2
+      ;;
+    --concise-log)
+      concise_log=1
+      shift
       ;;
     --help|-h)
       usage
@@ -65,11 +71,20 @@ echo "CUDA arch: $arch"
 echo "Source: $source_file"
 echo "Output: $output_file"
 
+extra_nvcc_flags=()
+if ((concise_log == 1)); then
+  extra_nvcc_flags+=("-DGEMM_CONCISE_LOG=1")
+  echo "Log mode: concise (winning configuration only)"
+else
+  echo "Log mode: full candidate details"
+fi
+
 "$nvcc_command" \
   -std=c++17 \
   -arch="$arch" \
   -I"$cutlass_root/include" \
   -I"$cutlass_root/tools/util/include" \
+  "${extra_nvcc_flags[@]}" \
   "$source_file" \
   -o "$output_file"
 

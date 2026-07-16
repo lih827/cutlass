@@ -117,6 +117,14 @@ def main() -> int:
                   "LayoutAAttention, LayoutBAttention, LayoutCAttention")
         name = f"cuBLASLt-derived {tbm}x{tbn}x{tbk} S{stages}"
         cases.append(
+            f"  // Raw cuBLASLt reference: algo_id={fields['algo_id']}, "
+            f"tile_id={fields['tile_id']} ({source[0]}x{source[1]}), "
+            f"stages_id={fields['stages_id']}, split_k={fields.get('split_k', '0')}, "
+            f"reduction={fields.get('reduction', '0')}, swizzle={fields.get('swizzle', '0')}, "
+            f"workspace={fields.get('workspace', '0')}.\n"
+            f"  // CUTLASS mapping: threadblock={tbm}x{tbn}x{tbk}, "
+            f"warp={wm}x{wn}x{wk}, stages={stages}, alignment={aa}/{ab}/{ac}, "
+            f"split_k={split_k}, tile_mapping={reason}, stage_mapping={stage_reason}.\n"
             f"  if (options.m == {m} && options.n == {n} && options.k == {k}) {{\n"
             f"    return profile_cublaslt_template<{layout}, {aa}, {ab}, {ac},\n"
             f"        cutlass::gemm::GemmShape<{tbm}, {tbn}, {tbk}>,\n"
