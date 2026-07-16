@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "cutlass/cutlass.h"
@@ -87,10 +88,10 @@ using AttentionQKGemm = GemmConfiguration<
     cutlass::gemm::GemmShape<16, 64, 32>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2>;
 
-// Candidate 3: long-K attention AV and other low-tile-count GEMMs.
+// Candidate 3: long-K attention PV and other low-tile-count GEMMs.
 template <typename LayoutA, typename LayoutB, typename LayoutC,
           int kAlignmentA, int kAlignmentB, int kAlignmentC>
-using AttentionAVStreamKGemm = GemmConfiguration<
+using AttentionPVStreamKGemm = GemmConfiguration<
     LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
     cutlass::gemm::GemmShape<32, 128, 32>,
     cutlass::gemm::GemmShape<16, 64, 32>,
@@ -461,6 +462,20 @@ void print_configuration(char const *configuration_name, Options const &options)
       << ConfigName<typename Gemm::ThreadblockSwizzle>::value() << "\n";
 }
 
+template <typename Gemm>
+std::string make_configuration_name(char const *family) {
+  std::ostringstream name;
+  name << family
+       << " TB" << Gemm::ThreadblockShape::kM
+       << "x" << Gemm::ThreadblockShape::kN
+       << "x" << Gemm::ThreadblockShape::kK
+       << "_W" << Gemm::WarpShape::kM
+       << "x" << Gemm::WarpShape::kN
+       << "x" << Gemm::WarpShape::kK
+       << "_S" << Gemm::kStages;
+  return name.str();
+}
+
 void print_result(char const *configuration_name, Result const &result) {
   std::cout << std::fixed << std::setprecision(4)
             << "Results: " << configuration_name << "\n"
@@ -501,8 +516,14 @@ int profile_all_candidates(Options const &options) {
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
   using AttentionQK = AttentionQKGemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
-  using AttentionAV = AttentionAVStreamKGemm<
+  using AttentionPV = AttentionPVStreamKGemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
+
+  std::string const linear_name = make_configuration_name<Linear>("Linear");
+  std::string const attention_qk_name =
+      make_configuration_name<AttentionQK>("Attention-QK");
+  std::string const attention_pv_name =
+      make_configuration_name<AttentionPV>("Attention-PV-StreamK");
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
@@ -510,17 +531,17 @@ int profile_all_candidates(Options const &options) {
     return EXIT_FAILURE;
   }
 
-  if (!kConciseLog) print_configuration<Linear>("Linear", options);
+  if (!kConciseLog) print_configuration<Linear>(linear_name.c_str(), options);
   Result linear = run_tensorop_gemm<Linear>(options, tensors);
-  if (!kConciseLog) print_result("Linear", linear);
+  if (!kConciseLog) print_result(linear_name.c_str(), linear);
 
-  if (!kConciseLog) print_configuration<AttentionQK>("Attention QK^T", options);
+  if (!kConciseLog) print_configuration<AttentionQK>(attention_qk_name.c_str(), options);
   Result attention_qk = run_tensorop_gemm<AttentionQK>(options, tensors);
-  if (!kConciseLog) print_result("Attention QK^T", attention_qk);
+  if (!kConciseLog) print_result(attention_qk_name.c_str(), attention_qk);
 
-  if (!kConciseLog) print_configuration<AttentionAV>("Attention AV Stream-K", options);
-  Result attention_av = run_tensorop_gemm<AttentionAV>(options, tensors);
-  if (!kConciseLog) print_result("Attention AV Stream-K", attention_av);
+  if (!kConciseLog) print_configuration<AttentionPV>(attention_pv_name.c_str(), options);
+  Result attention_pv = run_tensorop_gemm<AttentionPV>(options, tensors);
+  if (!kConciseLog) print_result(attention_pv_name.c_str(), attention_pv);
 
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
@@ -534,21 +555,21 @@ int profile_all_candidates(Options const &options) {
   }
   if (linear.status == cutlass::Status::kSuccess && linear.passed) {
     if (!best_result || linear.avg_time_ms < best_result->avg_time_ms) {
-      best_configuration_name = "Linear";
+      best_configuration_name = linear_name.c_str();
       best_result = &linear;
       best_is_generated = false;
     }
   }
   if (attention_qk.status == cutlass::Status::kSuccess && attention_qk.passed &&
       (!best_result || attention_qk.avg_time_ms < best_result->avg_time_ms)) {
-    best_configuration_name = "Attention QK^T";
+    best_configuration_name = attention_qk_name.c_str();
     best_result = &attention_qk;
     best_is_generated = false;
   }
-  if (attention_av.status == cutlass::Status::kSuccess && attention_av.passed &&
-      (!best_result || attention_av.avg_time_ms < best_result->avg_time_ms)) {
-    best_configuration_name = "Attention AV Stream-K";
-    best_result = &attention_av;
+  if (attention_pv.status == cutlass::Status::kSuccess && attention_pv.passed &&
+      (!best_result || attention_pv.avg_time_ms < best_result->avg_time_ms)) {
+    best_configuration_name = attention_pv_name.c_str();
+    best_result = &attention_pv;
     best_is_generated = false;
   }
 
@@ -568,7 +589,7 @@ int profile_all_candidates(Options const &options) {
       print_configuration<AttentionQK>(best_configuration_name, options);
       print_result(best_configuration_name, *best_result);
     } else {
-      print_configuration<AttentionAV>(best_configuration_name, options);
+      print_configuration<AttentionPV>(best_configuration_name, options);
       print_result(best_configuration_name, *best_result);
     }
   }
@@ -596,35 +617,48 @@ int profile_large_m_candidates(Options const &options) {
   using Tile64x256 = LargeM64x256Gemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
 
+  std::string const tile_128x128_name =
+      make_configuration_name<Tile128x128>("Large-M");
+  std::string const tile_128x256_name =
+      make_configuration_name<Tile128x256>("Large-M");
+  std::string const tile_256x128_name =
+      make_configuration_name<Tile256x128>("Large-M");
+  std::string const tile_64x128_name =
+      make_configuration_name<Tile64x128>("Large-M");
+  std::string const tile_128x64_name =
+      make_configuration_name<Tile128x64>("Large-M");
+  std::string const tile_64x256_name =
+      make_configuration_name<Tile64x256>("Large-M");
+
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
       !compute_reference(options, tensors)) {
     return EXIT_FAILURE;
   }
 
-  if (!kConciseLog) print_configuration<Tile128x128>("Large-M 128x128", options);
+  if (!kConciseLog) print_configuration<Tile128x128>(tile_128x128_name.c_str(), options);
   Result tile_128x128 = run_tensorop_gemm<Tile128x128>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 128x128", tile_128x128);
+  if (!kConciseLog) print_result(tile_128x128_name.c_str(), tile_128x128);
 
-  if (!kConciseLog) print_configuration<Tile128x256>("Large-M 128x256", options);
+  if (!kConciseLog) print_configuration<Tile128x256>(tile_128x256_name.c_str(), options);
   Result tile_128x256 = run_tensorop_gemm<Tile128x256>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 128x256", tile_128x256);
+  if (!kConciseLog) print_result(tile_128x256_name.c_str(), tile_128x256);
 
-  if (!kConciseLog) print_configuration<Tile256x128>("Large-M 256x128", options);
+  if (!kConciseLog) print_configuration<Tile256x128>(tile_256x128_name.c_str(), options);
   Result tile_256x128 = run_tensorop_gemm<Tile256x128>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 256x128", tile_256x128);
+  if (!kConciseLog) print_result(tile_256x128_name.c_str(), tile_256x128);
 
-  if (!kConciseLog) print_configuration<Tile64x128>("Large-M 64x128", options);
+  if (!kConciseLog) print_configuration<Tile64x128>(tile_64x128_name.c_str(), options);
   Result tile_64x128 = run_tensorop_gemm<Tile64x128>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 64x128", tile_64x128);
+  if (!kConciseLog) print_result(tile_64x128_name.c_str(), tile_64x128);
 
-  if (!kConciseLog) print_configuration<Tile128x64>("Large-M 128x64", options);
+  if (!kConciseLog) print_configuration<Tile128x64>(tile_128x64_name.c_str(), options);
   Result tile_128x64 = run_tensorop_gemm<Tile128x64>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 128x64", tile_128x64);
+  if (!kConciseLog) print_result(tile_128x64_name.c_str(), tile_128x64);
 
-  if (!kConciseLog) print_configuration<Tile64x256>("Large-M 64x256", options);
+  if (!kConciseLog) print_configuration<Tile64x256>(tile_64x256_name.c_str(), options);
   Result tile_64x256 = run_tensorop_gemm<Tile64x256>(options, tensors);
-  if (!kConciseLog) print_result("Large-M 64x256", tile_64x256);
+  if (!kConciseLog) print_result(tile_64x256_name.c_str(), tile_64x256);
 
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
@@ -644,12 +678,12 @@ int profile_large_m_candidates(Options const &options) {
     best_result = &generated_candidate_result.result;
     best_is_generated = true;
   }
-  consider("Large-M 128x128", tile_128x128);
-  consider("Large-M 128x256", tile_128x256);
-  consider("Large-M 256x128", tile_256x128);
-  consider("Large-M 64x128", tile_64x128);
-  consider("Large-M 128x64", tile_128x64);
-  consider("Large-M 64x256", tile_64x256);
+  consider(tile_128x128_name.c_str(), tile_128x128);
+  consider(tile_128x256_name.c_str(), tile_128x256);
+  consider(tile_256x128_name.c_str(), tile_256x128);
+  consider(tile_64x128_name.c_str(), tile_64x128);
+  consider(tile_128x64_name.c_str(), tile_128x64);
+  consider(tile_64x256_name.c_str(), tile_64x256);
 
   if (!best_result) {
     std::cerr << "\nNo large-M candidate completed successfully and passed verification.\n";

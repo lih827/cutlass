@@ -115,7 +115,10 @@ def main() -> int:
         split_k = max(1, int(fields.get("split_k", "0")))
         layout = ("LayoutAM1, LayoutBM1, LayoutCM1" if m == 1 else
                   "LayoutAAttention, LayoutBAttention, LayoutCAttention")
-        name = f"cuBLASLt-derived {tbm}x{tbn}x{tbk} S{stages}"
+        name = (
+            f"cuBLASLt-derived TB{tbm}x{tbn}x{tbk}_"
+            f"W{wm}x{wn}x{wk}_S{stages}"
+        )
         cases.append(
             f"  // Raw cuBLASLt reference: algo_id={fields['algo_id']}, "
             f"tile_id={fields['tile_id']} ({source[0]}x{source[1]}), "

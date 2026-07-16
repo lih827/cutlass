@@ -152,7 +152,7 @@ base_operations=(
   "MLP Down"
   "LM Head"
 )
-attention_operations=("Attention QK^T" "Attention AV")
+attention_operations=("Attention QK^T" "Attention PV")
 
 for length in "${lengths[@]}"; do
   if ! [[ "$length" =~ ^[1-9][0-9]*$ ]]; then
@@ -171,7 +171,7 @@ shape_for_decode_op() {
     "Q")              m=$token_m;     n=$h;                     k=$h ;;
     "K"|"V")         m=$token_m;     n=$((kv_heads * head_dim)); k=$h ;;
     "Attention QK^T") m=$attention_m; n=$context_length;        k=$head_dim ;;
-    "Attention AV")   m=$attention_m; n=$head_dim;              k=$context_length ;;
+    "Attention PV")   m=$attention_m; n=$head_dim;              k=$context_length ;;
     "Attention Out")  m=$token_m;     n=$h;                     k=$h ;;
     "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate)); k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                     k=$intermediate ;;
@@ -190,7 +190,7 @@ shape_for_prefill_op() {
     "Q")              m=$token_m;     n=$h;                      k=$h ;;
     "K"|"V")         m=$token_m;     n=$((kv_heads * head_dim)); k=$h ;;
     "Attention QK^T") m=$attention_m; n=$sequence_length;        k=$head_dim ;;
-    "Attention AV")   m=$attention_m; n=$head_dim;               k=$sequence_length ;;
+    "Attention PV")   m=$attention_m; n=$head_dim;               k=$sequence_length ;;
     "Attention Out")  m=$token_m;     n=$h;                      k=$h ;;
     "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate));   k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                      k=$intermediate ;;

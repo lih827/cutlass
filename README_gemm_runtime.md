@@ -196,9 +196,9 @@ bash run_gemm.sh --help
 小 M 用例会比较：
 
 ```text
-Linear
-Attention QK^T
-Attention AV Stream-K
+Linear TB..._W..._S...
+Attention-QK TB..._W..._S...
+Attention-PV-StreamK TB..._W..._S...
 ```
 
 大 M 用例会比较：
