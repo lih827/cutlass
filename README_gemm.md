@@ -24,6 +24,14 @@ cutlass/
 
 `build_gemm.sh` 和 `run_gemm.sh` 都必须从 CUTLASS 根目录执行。
 
+脚本既支持直接执行，也支持显式通过 Bash 调用；使用 `bash` 时不要求脚本文件具有执行权限：
+
+```bash
+bash build_gemm.sh --arch sm_89
+bash run_gemm.sh --model 7b
+bash tune_cutlass_from_cublaslt.sh --model 7b --arch sm_89
+```
+
 ## 环境要求
 
 - Linux

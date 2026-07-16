@@ -3,6 +3,8 @@
 set -uo pipefail
 
 original_args=("$@")
+script_path="${BASH_SOURCE[0]}"
+bash_command="${BASH:-bash}"
 model="7b"
 stage=""
 backend="cutlass"
@@ -89,8 +91,8 @@ backend="${backend,,}"
 # Decode and Prefill. The appended option wins over a preceding --stage all.
 if [[ -z "$stage" || "$stage" == "all" ]]; then
   overall_status=0
-  "$0" "${original_args[@]}" --stage decode || overall_status=$?
-  "$0" "${original_args[@]}" --stage prefill || overall_status=$?
+  "$bash_command" "$script_path" "${original_args[@]}" --stage decode || overall_status=$?
+  "$bash_command" "$script_path" "${original_args[@]}" --stage prefill || overall_status=$?
   exit "$overall_status"
 fi
 
