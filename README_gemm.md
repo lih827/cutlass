@@ -89,6 +89,15 @@ chmod +x build_gemm.sh run_gemm.sh
 
 精简日志仍会在内部执行所有 CUTLASS 候选以及命中的 cuBLASLt 派生候选，只抑制非最佳项的输出，不会改变选优过程。要恢复完整日志，重新执行不带 `--concise-log` 的 build。
 
+默认使用 CUDA Event 计时。也可以在编译时切换为 `std::chrono::steady_clock`：
+
+```bash
+./build_gemm.sh --arch sm_89 --timer cuda-event
+./build_gemm.sh --arch sm_89 --timer chrono
+```
+
+`chrono` 模式会在计时区间前后执行 `cudaDeviceSynchronize()`，因此测量的是整段迭代的主机墙钟时间；适合与主机侧计时程序保持一致。短 kernel 的精确性能比较优先使用默认的 `cuda-event`。
+
 指定 `nvcc` 路径：
 
 ```bash

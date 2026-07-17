@@ -5,6 +5,7 @@ set -euo pipefail
 arch="sm_89"
 nvcc_command="${NVCC:-nvcc}"
 concise_log=0
+timer="cuda-event"
 
 usage() {
   cat <<'EOF'
@@ -17,6 +18,7 @@ Options:
   --arch ARCH       CUDA architecture, for example sm_80 or sm_89 (default: sm_89)
   --nvcc PATH       nvcc executable (default: $NVCC or nvcc)
   --concise-log     Compile gemm to print only the winning candidate details
+  --timer TIMER     cuda-event or chrono (default: cuda-event)
   --help            Show this help
 EOF
 }
@@ -37,6 +39,11 @@ while (($# > 0)); do
       concise_log=1
       shift
       ;;
+    --timer)
+      [[ $# -ge 2 ]] || { echo "Missing value for --timer" >&2; exit 2; }
+      timer="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -48,6 +55,11 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+[[ "$timer" == "cuda-event" || "$timer" == "chrono" ]] || {
+  echo "Unsupported timer: $timer (expected cuda-event or chrono)" >&2
+  exit 2
+}
 
 cutlass_root="$(pwd)"
 source_file="$cutlass_root/examples/gemm/gemm.cu"
@@ -72,6 +84,10 @@ echo "Source: $source_file"
 echo "Output: $output_file"
 
 extra_nvcc_flags=()
+if [[ "$timer" == "chrono" ]]; then
+  extra_nvcc_flags+=("-DGEMM_USE_CHRONO=1")
+fi
+echo "Timer: $timer"
 if ((concise_log == 1)); then
   extra_nvcc_flags+=("-DGEMM_CONCISE_LOG=1")
   echo "Log mode: concise (winning configuration only)"

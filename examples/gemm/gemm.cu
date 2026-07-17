@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -33,6 +34,12 @@ namespace {
 constexpr bool kConciseLog = true;
 #else
 constexpr bool kConciseLog = false;
+#endif
+
+#if defined(GEMM_USE_CHRONO) && GEMM_USE_CHRONO
+constexpr bool kUseChronoTimer = true;
+#else
+constexpr bool kUseChronoTimer = false;
 #endif
 
 using ElementA = cutlass::half_t;
@@ -386,28 +393,50 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
     return result;
   }
 
-  cudaEvent_t start_event = nullptr;
-  cudaEvent_t stop_event = nullptr;
-  if (cudaEventCreate(&start_event) != cudaSuccess ||
-      cudaEventCreate(&stop_event) != cudaSuccess) {
-    result.status = cutlass::Status::kErrorInternal;
-    return result;
-  }
-
-  cudaEventRecord(start_event);
-  for (int iteration = 0; iteration < options.iterations; ++iteration) {
-    result.status = gemm();
-    if (result.status != cutlass::Status::kSuccess) {
-      break;
-    }
-  }
-  cudaEventRecord(stop_event);
-  cudaEventSynchronize(stop_event);
-
   float elapsed_ms = 0.0f;
-  cudaEventElapsedTime(&elapsed_ms, start_event, stop_event);
-  cudaEventDestroy(start_event);
-  cudaEventDestroy(stop_event);
+  if constexpr (kUseChronoTimer) {
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      result.status = cutlass::Status::kErrorInternal;
+      return result;
+    }
+    auto const start_time = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < options.iterations; ++iteration) {
+      result.status = gemm();
+      if (result.status != cutlass::Status::kSuccess) {
+        break;
+      }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      result.status = cutlass::Status::kErrorInternal;
+      return result;
+    }
+    auto const stop_time = std::chrono::steady_clock::now();
+    elapsed_ms = std::chrono::duration<float, std::milli>(
+                     stop_time - start_time).count();
+  } else {
+    cudaEvent_t start_event = nullptr;
+    cudaEvent_t stop_event = nullptr;
+    if (cudaEventCreate(&start_event) != cudaSuccess ||
+        cudaEventCreate(&stop_event) != cudaSuccess) {
+      if (start_event) cudaEventDestroy(start_event);
+      if (stop_event) cudaEventDestroy(stop_event);
+      result.status = cutlass::Status::kErrorInternal;
+      return result;
+    }
+
+    cudaEventRecord(start_event);
+    for (int iteration = 0; iteration < options.iterations; ++iteration) {
+      result.status = gemm();
+      if (result.status != cutlass::Status::kSuccess) {
+        break;
+      }
+    }
+    cudaEventRecord(stop_event);
+    cudaEventSynchronize(stop_event);
+    cudaEventElapsedTime(&elapsed_ms, start_event, stop_event);
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+  }
 
   if (result.status != cutlass::Status::kSuccess) {
     return result;
@@ -430,6 +459,7 @@ void print_configuration(char const *configuration_name, Options const &options)
       << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
       << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
       << "  iterations: " << options.iterations << "\n"
+      << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
       << "  split-K slices: " << options.split_k_slices << "\n"
       << "  A: " << ConfigName<ElementA>::value() << ", "
       << ConfigName<typename Gemm::LayoutA>::value() << "\n"
@@ -494,6 +524,7 @@ void print_generated_configuration(Options const &options) {
             << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
             << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
             << "  iterations: " << options.iterations << "\n"
+            << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
             << "  split-K slices: " << g.split_k_slices << "\n"
             << "  A: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
             << "  B: half, column-major\n"

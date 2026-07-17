@@ -88,6 +88,15 @@ bash build_gemm.sh --arch sm_89 --concise-log
 
 精简日志只抑制非最佳候选的输出，不会减少实际测试的候选数量。恢复完整日志需要重新执行不带 `--concise-log` 的 build。
 
+默认使用 CUDA Event 计时。编译时可切换为 `std::chrono::steady_clock`：
+
+```bash
+bash build_gemm.sh --arch sm_89 --timer cuda-event
+bash build_gemm.sh --arch sm_89 --timer chrono
+```
+
+`chrono` 模式在计时前后同步 GPU，输出仍使用相同的 `avg_time` 和 `gflops` 字段。短 kernel 的精确性能比较建议保留默认的 `cuda-event`。
+
 GEMM 可执行文件为：
 
 ```text
