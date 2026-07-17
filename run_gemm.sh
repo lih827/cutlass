@@ -148,7 +148,8 @@ base_operations=(
   "K"
   "V"
   "Attention Out"
-  "MLP Up/Gate"
+  "MLP Up"
+  "MLP Gate"
   "MLP Down"
   "LM Head"
 )
@@ -173,7 +174,7 @@ shape_for_decode_op() {
     "Attention QK^T") m=$attention_m; n=$context_length;        k=$head_dim ;;
     "Attention PV")   m=$attention_m; n=$head_dim;              k=$context_length ;;
     "Attention Out")  m=$token_m;     n=$h;                     k=$h ;;
-    "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate)); k=$h ;;
+    "MLP Up"|"MLP Gate") m=$token_m; n=$intermediate; k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                     k=$intermediate ;;
     "LM Head")        m=$token_m;     n=$vocab;                 k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
@@ -192,7 +193,7 @@ shape_for_prefill_op() {
     "Attention QK^T") m=$attention_m; n=$sequence_length;        k=$head_dim ;;
     "Attention PV")   m=$attention_m; n=$head_dim;               k=$sequence_length ;;
     "Attention Out")  m=$token_m;     n=$h;                      k=$h ;;
-    "MLP Up/Gate")    m=$token_m;     n=$((2 * intermediate));   k=$h ;;
+    "MLP Up"|"MLP Gate") m=$token_m; n=$intermediate; k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                      k=$intermediate ;;
     "LM Head")        m=$token_m;     n=$vocab;                  k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
@@ -206,6 +207,11 @@ add_unique_case() {
   local operation="$1"
   local context_length="$2"
   local key="${m}x${n}x${k}"
+  # Up and Gate have identical shapes but are two independent projections.
+  # Keep both executions while continuing to deduplicate all other equal shapes.
+  if [[ "$operation" == "MLP Up" || "$operation" == "MLP Gate" ]]; then
+    key+=":$operation"
+  fi
   local slot
 
   if [[ -n "${shape_to_slot[$key]+present}" ]]; then

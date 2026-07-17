@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
 def parse_log(path: Path) -> list[ParsedResult]:
     current_case: dict[str, str] | None = None
     pending_configuration: str | None = None
-    results: dict[tuple[int, int, int], ParsedResult] = {}
+    results: dict[tuple[tuple[int, int, int], str], ParsedResult] = {}
 
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for raw_line in stream:
@@ -112,7 +112,7 @@ def parse_log(path: Path) -> list[ParsedResult]:
                     best_configuration=pending_configuration,
                     gflops=float(gflops_match.group("gflops")),
                 )
-                results[result.shape] = result
+                results[(result.shape, result.source_operations)] = result
                 pending_configuration = None
 
     if not results:
@@ -123,7 +123,7 @@ def parse_log(path: Path) -> list[ParsedResult]:
     return list(results.values())
 
 
-def find_shape_rows(sheet) -> dict[tuple[int, int, int], int]:
+def find_shape_rows(sheet) -> dict[tuple[int, int, int], list[int]]:
     expected_headers = {
         "C": "M",
         "D": "N",
@@ -139,14 +139,12 @@ def find_shape_rows(sheet) -> dict[tuple[int, int, int], int]:
                 f"expected {expected!r}."
             )
 
-    rows: dict[tuple[int, int, int], int] = {}
+    rows: dict[tuple[int, int, int], list[int]] = {}
     for row in range(FIRST_DATA_ROW, sheet.max_row + 1):
         values = [sheet.cell(row, column).value for column in (3, 4, 5)]
         if all(isinstance(value, (int, float)) for value in values):
             shape = tuple(int(value) for value in values)
-            if shape in rows:
-                raise ValueError(f"Duplicate M/N/K in XLSX template: {shape}")
-            rows[shape] = row
+            rows.setdefault(shape, []).append(row)
     return rows
 
 
@@ -173,7 +171,15 @@ def update_workbook(template: Path, output: Path, results: list[ParsedResult]) -
         raise ValueError(f"M/N/K not found in XLSX template: {formatted}")
 
     for result in results:
-        row = shape_rows[result.shape]
+        candidates = shape_rows[result.shape]
+        row = next(
+            (
+                candidate
+                for candidate in candidates
+                if sheet.cell(candidate, 2).value == result.source_operations
+            ),
+            candidates[0],
+        )
         sheet.cell(row, 1).value = result.sequence_label
         sheet.cell(row, 2).value = result.source_operations
         sheet.cell(row, 6).value = result.best_configuration
