@@ -38,3 +38,23 @@ GEMM_OPTIMAL_ENTRY(128, 3584, 18944,
     LayoutAAttention, LayoutBAttention, LayoutCAttention, 8, 8, 8,
     64, 64, 32, 32, 64, 32,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 4)
+
+GEMM_OPTIMAL_ENTRY(128, 512, 3584,
+    LayoutAAttention, LayoutBAttention, LayoutCAttention, 8, 8, 8,
+    64, 128, 32, 32, 64, 32,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3)
+
+GEMM_OPTIMAL_ENTRY(1, 512, 3584,
+    LayoutAM1, LayoutBM1, LayoutCM1, 8, 8, 8,
+    32, 128, 32, 16, 64, 32,
+    cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 4)
+
+GEMM_OPTIMAL_ENTRY(3584, 128, 128,
+    LayoutAAttention, LayoutBAttention, LayoutCAttention, 8, 8, 8,
+    64, 128, 32, 32, 64, 32,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3)
+
+GEMM_OPTIMAL_ENTRY(28, 128, 128,
+    LayoutAAttention, LayoutBAttention, LayoutCAttention, 4, 8, 4,
+    32, 128, 32, 16, 64, 32,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2)
