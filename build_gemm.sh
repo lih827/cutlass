@@ -6,6 +6,7 @@ arch="sm_89"
 nvcc_command="${NVCC:-nvcc}"
 concise_log=0
 timer="cuda-event"
+optimal_only=0
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,7 @@ Options:
   --nvcc PATH       nvcc executable (default: $NVCC or nvcc)
   --concise-log     Compile gemm to print only the winning candidate details
   --timer TIMER     cuda-event or chrono (default: cuda-event)
+  --optimal-only    Run one preselected template for mapped exact M/N/K shapes
   --help            Show this help
 EOF
 }
@@ -43,6 +45,10 @@ while (($# > 0)); do
       [[ $# -ge 2 ]] || { echo "Missing value for --timer" >&2; exit 2; }
       timer="$2"
       shift 2
+      ;;
+    --optimal-only)
+      optimal_only=1
+      shift
       ;;
     --help|-h)
       usage
@@ -86,6 +92,12 @@ echo "Output: $output_file"
 extra_nvcc_flags=()
 if [[ "$timer" == "chrono" ]]; then
   extra_nvcc_flags+=("-DGEMM_USE_CHRONO=1")
+fi
+if ((optimal_only == 1)); then
+  extra_nvcc_flags+=("-DGEMM_OPTIMAL_ONLY=1")
+  echo "Candidate mode: optimal-only for mapped shapes"
+else
+  echo "Candidate mode: compare all applicable candidates"
 fi
 echo "Timer: $timer"
 if ((concise_log == 1)); then

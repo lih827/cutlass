@@ -18,7 +18,8 @@ cutlass/
 └── examples/
     └── gemm/
         ├── gemm.cu
-        └── cublaslt_generated_candidates.inc  # 可选
+        ├── cublaslt_generated_candidates.inc  # 可选
+        └── optimal_configurations.inc          # 最优模板映射
 ```
 
 `build_gemm.sh` 和 `run_gemm.sh` 必须从 CUTLASS 根目录执行。
@@ -96,6 +97,14 @@ bash build_gemm.sh --arch sm_89 --timer chrono
 ```
 
 `chrono` 模式在计时前后同步 GPU，输出仍使用相同的 `avg_time` 和 `gflops` 字段。短 kernel 的精确性能比较建议保留默认的 `cuda-event`。
+
+只运行一个模板以缩短测试时间：
+
+```bash
+bash build_gemm.sh --arch sm_89 --optimal-only
+```
+
+命中 `examples/gemm/optimal_configurations.inc` 中的精确 `M/N/K` 时只执行对应最优模板；未命中时确定性地伪随机选择一个合法模板，同一 shape 的选择可复现。后续增加最优 shape 时只需向 `.inc` 添加 `GEMM_OPTIMAL_ENTRY(...)` 并重新 build。
 
 GEMM 可执行文件为：
 

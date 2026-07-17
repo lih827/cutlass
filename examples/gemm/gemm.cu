@@ -42,6 +42,12 @@ constexpr bool kUseChronoTimer = true;
 constexpr bool kUseChronoTimer = false;
 #endif
 
+#if defined(GEMM_OPTIMAL_ONLY) && GEMM_OPTIMAL_ONLY
+constexpr bool kOptimalOnly = true;
+#else
+constexpr bool kOptimalOnly = false;
+#endif
+
 using ElementA = cutlass::half_t;
 using ElementB = cutlass::half_t;
 using ElementC = cutlass::half_t;
@@ -746,6 +752,81 @@ int profile_large_m_candidates(Options const &options) {
   return EXIT_SUCCESS;
 }
 
+// Executes one preselected template for exact shapes whose best configuration
+// has already been established on the target environment.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC,
+          typename ThreadblockShape, typename WarpShape,
+          typename ThreadblockSwizzle, int kStages>
+int profile_optimal_template(char const *family, Options const &options) {
+  using Gemm = GemmConfiguration<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+      ThreadblockShape, WarpShape, ThreadblockSwizzle, kStages>;
+  using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
+  std::string const name = make_configuration_name<Gemm>(family);
+  TensorSet tensors;
+  if (!initialize_tensors(options, tensors) || !compute_reference(options, tensors)) {
+    return EXIT_FAILURE;
+  }
+  print_configuration<Gemm>(name.c_str(), options);
+  Result result = run_tensorop_gemm<Gemm>(options, tensors);
+  print_result(name.c_str(), result);
+  if (result.status != cutlass::Status::kSuccess || !result.passed) {
+    return EXIT_FAILURE;
+  }
+  std::cout << "\nBest configuration: " << name << "\n"
+            << "  avg_time: " << result.avg_time_ms << " ms\n"
+            << "  gflops: " << result.gflops << "\n";
+  return EXIT_SUCCESS;
+}
+
+int profile_optimal_only_candidate(Options const &options) {
+#define GEMM_OPTIMAL_ENTRY(M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C,              \
+                           ALIGN_A, ALIGN_B, ALIGN_C,                           \
+                           TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE, STAGES)   \
+  if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+    return profile_optimal_template<                                            \
+        LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
+        cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(              \
+            "Optimal", options);                                               \
+  }
+#if __has_include("optimal_configurations.inc")
+#include "optimal_configurations.inc"
+#endif
+#undef GEMM_OPTIMAL_ENTRY
+  return -1;
+}
+
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+int profile_unmapped_single_candidate(Options const &options) {
+  using Identity = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+  using TB32x256 = cutlass::gemm::GemmShape<32, 256, 32>;
+  using TB32x128 = cutlass::gemm::GemmShape<32, 128, 32>;
+  using TB64x128 = cutlass::gemm::GemmShape<64, 128, 32>;
+  using W32x64 = cutlass::gemm::GemmShape<32, 64, 32>;
+  using W16x64 = cutlass::gemm::GemmShape<16, 64, 32>;
+  unsigned long long hash =
+      static_cast<unsigned long long>(options.m) * 73856093ull ^
+      static_cast<unsigned long long>(options.n) * 19349663ull ^
+      static_cast<unsigned long long>(options.k) * 83492791ull;
+  switch (hash % 3) {
+    case 0:
+      return profile_optimal_template<LayoutA, LayoutB, LayoutC,
+          kAlignmentA, kAlignmentB, kAlignmentC,
+          TB32x256, W32x64, Identity, kStages>("Fallback-random", options);
+    case 1:
+      return profile_optimal_template<LayoutA, LayoutB, LayoutC,
+          kAlignmentA, kAlignmentB, kAlignmentC,
+          TB32x128, W16x64, Identity, kStages>("Fallback-random", options);
+    default:
+      return profile_optimal_template<LayoutA, LayoutB, LayoutC,
+          kAlignmentA, kAlignmentB, kAlignmentC,
+          TB64x128, W32x64, Identity, kStages>("Fallback-random", options);
+  }
+}
+
 // Runs one template generated from the locally measured cuBLASLt winner.
 // The generated header only instantiates configurations referenced by the
 // current Decode/Prefill shape set, keeping the CUTLASS compile search small.
@@ -841,6 +922,47 @@ int main(int argc, char const **argv) {
     std::cerr << "This example requires SM80 or newer; detected SM"
               << device_properties.major << device_properties.minor << ".\n";
     return EXIT_FAILURE;
+  }
+
+  if (kOptimalOnly) {
+    int optimal_status = profile_optimal_only_candidate(options);
+    if (optimal_status != -1) {
+      return optimal_status;
+    }
+    std::cout << "Optimal-only: no exact M/N/K mapping; selecting one "
+                 "deterministic pseudo-random fallback template.\n";
+    if (options.m == 1) {
+      return profile_unmapped_single_candidate<
+          LayoutAM1, LayoutBM1, LayoutCM1, 8, 8, 8, 4>(options);
+    }
+    if (options.m >= 128) {
+      if (options.m % 8 == 0 && options.k % 8 == 0) {
+        return profile_unmapped_single_candidate<
+            LayoutAAttention, LayoutBAttention, LayoutCAttention,
+            8, 8, 8, 3>(options);
+      }
+      return profile_unmapped_single_candidate<
+          LayoutAAttention, LayoutBAttention, LayoutCAttention,
+          1, 1, 1, 2>(options);
+    }
+    if (options.m % 2 != 0 || options.k % 8 != 0) {
+      return profile_unmapped_single_candidate<
+          LayoutAAttention, LayoutBAttention, LayoutCAttention,
+          1, 1, 1, 2>(options);
+    }
+    if (options.m % 8 == 0) {
+      return profile_unmapped_single_candidate<
+          LayoutAAttention, LayoutBAttention, LayoutCAttention,
+          8, 8, 8, 2>(options);
+    }
+    if (options.m % 4 == 0) {
+      return profile_unmapped_single_candidate<
+          LayoutAAttention, LayoutBAttention, LayoutCAttention,
+          4, 8, 4, 2>(options);
+    }
+    return profile_unmapped_single_candidate<
+        LayoutAAttention, LayoutBAttention, LayoutCAttention,
+        2, 8, 2, 2>(options);
   }
 
   // A generated exact-shape template takes precedence. A return value of -1

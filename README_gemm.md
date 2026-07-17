@@ -19,7 +19,8 @@ cutlass/
     └── gemm/
         ├── gemm.cu
         ├── cublaslt_profiler.cu
-        └── cublaslt_generated_candidates.inc
+        ├── cublaslt_generated_candidates.inc
+        └── optimal_configurations.inc
 ```
 
 `build_gemm.sh` 和 `run_gemm.sh` 都必须从 CUTLASS 根目录执行。
@@ -97,6 +98,16 @@ chmod +x build_gemm.sh run_gemm.sh
 ```
 
 `chrono` 模式会在计时区间前后执行 `cudaDeviceSynchronize()`，因此测量的是整段迭代的主机墙钟时间；适合与主机侧计时程序保持一致。短 kernel 的精确性能比较优先使用默认的 `cuda-event`。
+
+已知部分 shape 的最优模板时，可编译单候选模式以减少执行时间：
+
+```bash
+./build_gemm.sh --arch sm_89 --optimal-only
+```
+
+该模式按 `examples/gemm/optimal_configurations.inc` 中的精确 `M/N/K` 映射只运行一个最优模板。未命中的 shape 也不会进行候选比较，而是根据 `M/N/K` 确定性地伪随机选择一个合法模板；同一 shape 每次选择一致。
+
+后续新增最优配置时，在 `.inc` 中增加一条 `GEMM_OPTIMAL_ENTRY` 并重新编译即可，无需修改 `gemm.cu`。每条记录依次指定：`M/N/K`、A/B/C Layout、A/B/C Alignment、ThreadblockShape、WarpShape、Swizzle 和 Stages。
 
 指定 `nvcc` 路径：
 
