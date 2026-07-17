@@ -207,11 +207,6 @@ add_unique_case() {
   local operation="$1"
   local context_length="$2"
   local key="${m}x${n}x${k}"
-  # Up and Gate have identical shapes but are two independent projections.
-  # Keep both executions while continuing to deduplicate all other equal shapes.
-  if [[ "$operation" == "MLP Up" || "$operation" == "MLP Gate" ]]; then
-    key+=":$operation"
-  fi
   local slot
 
   if [[ -n "${shape_to_slot[$key]+present}" ]]; then

@@ -162,7 +162,7 @@ Prefill 默认序列长度：
 128, 256, 512, 1024, 2048, 129, 130, 132, 136
 ```
 
-Qwen2.5-7B 默认包含 15 个 Decode GEMM 和 71 个 Prefill GEMM。相同 `M/N/K` 的来源算子通常会合并，只执行一次；`MLP Up` 与 `MLP Gate` 均采用 `N=I`，但作为两个独立投影分别执行。
+Qwen2.5-7B 默认包含 14 个唯一 Decode GEMM 和 62 个唯一 Prefill GEMM。相同 `M/N/K` 的来源算子会合并，只执行一次；`MLP Up` 与 `MLP Gate` 均采用 `N=I`，并作为相同 shape 合并统计。
 
 ## 支持的模型
 
