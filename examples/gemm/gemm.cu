@@ -48,6 +48,12 @@ constexpr bool kOptimalOnly = true;
 constexpr bool kOptimalOnly = false;
 #endif
 
+#if defined(GEMM_SKIP_VERIFICATION) && GEMM_SKIP_VERIFICATION
+constexpr bool kVerifyResults = false;
+#else
+constexpr bool kVerifyResults = true;
+#endif
+
 using ElementA = cutlass::half_t;
 using ElementB = cutlass::half_t;
 using ElementC = cutlass::half_t;
@@ -294,7 +300,22 @@ bool initialize_tensors(Options const &options, TensorSet &tensors) {
   tensors.b.resize({options.k, options.n});
   tensors.c.resize({options.m, options.n});
   tensors.d.resize({options.m, options.n});
-  tensors.reference.resize({options.m, options.n});
+  if constexpr (kVerifyResults) {
+    tensors.reference.resize({options.m, options.n});
+  }
+
+  if constexpr (!kVerifyResults) {
+    CUDA_RETURN_IF_ERROR(cudaMemset(
+        tensors.a.device_data(), 0,
+        size_t(options.m) * options.k * sizeof(ElementA)));
+    CUDA_RETURN_IF_ERROR(cudaMemset(
+        tensors.b.device_data(), 0,
+        size_t(options.k) * options.n * sizeof(ElementB)));
+    CUDA_RETURN_IF_ERROR(cudaMemset(
+        tensors.c.device_data(), 0,
+        size_t(options.m) * options.n * sizeof(ElementC)));
+    return true;
+  }
 
   cutlass::reference::host::TensorFillRandomUniform(
       tensors.a.host_view(), 2026, ElementA(2), ElementA(-2), 0);
@@ -302,14 +323,18 @@ bool initialize_tensors(Options const &options, TensorSet &tensors) {
       tensors.b.host_view(), 2027, ElementB(2), ElementB(-2), 0);
   cutlass::reference::host::TensorFillRandomUniform(
       tensors.c.host_view(), 2028, ElementC(2), ElementC(-2), 0);
-  cutlass::reference::host::TensorFill(tensors.d.host_view(), ElementC(0));
-  cutlass::reference::host::TensorFill(tensors.reference.host_view(), ElementC(0));
+  if constexpr (kVerifyResults) {
+    cutlass::reference::host::TensorFill(tensors.d.host_view(), ElementC(0));
+    cutlass::reference::host::TensorFill(tensors.reference.host_view(), ElementC(0));
+  }
 
   tensors.a.sync_device();
   tensors.b.sync_device();
   tensors.c.sync_device();
-  tensors.d.sync_device();
-  tensors.reference.sync_device();
+  if constexpr (kVerifyResults) {
+    tensors.d.sync_device();
+    tensors.reference.sync_device();
+  }
   CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return true;
 }
@@ -452,9 +477,13 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
   result.gflops = 2.0 * double(options.m) * double(options.n) * double(options.k) /
                   (result.avg_time_ms * 1.0e6);
 
-  tensors.d.sync_host();
-  result.passed = cutlass::reference::host::TensorEquals(
-      tensors.d.host_view(), tensors.reference.host_view());
+  if constexpr (kVerifyResults) {
+    tensors.d.sync_host();
+    result.passed = cutlass::reference::host::TensorEquals(
+        tensors.d.host_view(), tensors.reference.host_view());
+  } else {
+    result.passed = true;
+  }
   return result;
 }
 
@@ -465,6 +494,7 @@ void print_configuration(char const *configuration_name, Options const &options)
       << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
       << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
       << "  iterations: " << options.iterations << "\n"
+      << "  verification: " << (kVerifyResults ? "enabled" : "disabled") << "\n"
       << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
       << "  split-K slices: " << options.split_k_slices << "\n"
       << "  A: " << ConfigName<ElementA>::value() << ", "
@@ -517,7 +547,8 @@ void print_result(char const *configuration_name, Result const &result) {
             << "Results: " << configuration_name << "\n"
             << "  Status: "
             << (result.status == cutlass::Status::kSuccess
-                    ? (result.passed ? "Passed" : "Failed verification")
+                    ? (!kVerifyResults ? "Not verified"
+                       : (result.passed ? "Passed" : "Failed verification"))
                     : cutlassGetStatusString(result.status))
             << "\n"
             << "  avg_time: " << result.avg_time_ms << " ms\n"
@@ -530,6 +561,7 @@ void print_generated_configuration(Options const &options) {
             << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
             << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
             << "  iterations: " << options.iterations << "\n"
+            << "  verification: " << (kVerifyResults ? "enabled" : "disabled") << "\n"
             << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
             << "  split-K slices: " << g.split_k_slices << "\n"
             << "  A: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
@@ -564,7 +596,7 @@ int profile_all_candidates(Options const &options) {
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
-      !compute_reference(options, tensors)) {
+      (kVerifyResults && !compute_reference(options, tensors))) {
     return EXIT_FAILURE;
   }
 
@@ -669,7 +701,7 @@ int profile_large_m_candidates(Options const &options) {
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
-      !compute_reference(options, tensors)) {
+      (kVerifyResults && !compute_reference(options, tensors))) {
     return EXIT_FAILURE;
   }
 
@@ -765,7 +797,8 @@ int profile_optimal_template(char const *family, Options const &options) {
   using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
   std::string const name = make_configuration_name<Gemm>(family);
   TensorSet tensors;
-  if (!initialize_tensors(options, tensors) || !compute_reference(options, tensors)) {
+  if (!initialize_tensors(options, tensors) ||
+      (kVerifyResults && !compute_reference(options, tensors))) {
     return EXIT_FAILURE;
   }
   print_configuration<Gemm>(name.c_str(), options);
@@ -843,7 +876,8 @@ int profile_cublaslt_template(char const *name, int split_k_slices,
   Options tuned_options = options;
   tuned_options.split_k_slices = std::max(1, split_k_slices);
   TensorSet tensors;
-  if (!initialize_tensors(tuned_options, tensors) || !compute_reference(tuned_options, tensors)) {
+  if (!initialize_tensors(tuned_options, tensors) ||
+      (kVerifyResults && !compute_reference(tuned_options, tensors))) {
     return -1;
   }
   if (!kConciseLog) print_configuration<Gemm>(name, tuned_options);

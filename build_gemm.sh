@@ -7,6 +7,7 @@ nvcc_command="${NVCC:-nvcc}"
 concise_log=0
 timer="cuda-event"
 optimal_only=0
+skip_verification=0
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,7 @@ Options:
   --concise-log     Compile gemm to print only the winning candidate details
   --timer TIMER     cuda-event or chrono (default: cuda-event)
   --optimal-only    Run one preselected template for mapped exact M/N/K shapes
+  --skip-verification  Skip reference GEMM, result copies, and comparison
   --help            Show this help
 EOF
 }
@@ -48,6 +50,10 @@ while (($# > 0)); do
       ;;
     --optimal-only)
       optimal_only=1
+      shift
+      ;;
+    --skip-verification)
+      skip_verification=1
       shift
       ;;
     --help|-h)
@@ -98,6 +104,12 @@ if ((optimal_only == 1)); then
   echo "Candidate mode: optimal-only for mapped shapes"
 else
   echo "Candidate mode: compare all applicable candidates"
+fi
+if ((skip_verification == 1)); then
+  extra_nvcc_flags+=("-DGEMM_SKIP_VERIFICATION=1")
+  echo "Verification: disabled"
+else
+  echo "Verification: enabled"
 fi
 echo "Timer: $timer"
 if ((concise_log == 1)); then

@@ -109,6 +109,14 @@ chmod +x build_gemm.sh run_gemm.sh
 
 后续新增最优配置时，在 `.inc` 中增加一条 `GEMM_OPTIMAL_ENTRY` 并重新编译即可，无需修改 `gemm.cu`。每条记录依次指定：`M/N/K`、A/B/C Layout、A/B/C Alignment、ThreadblockShape、WarpShape、Swizzle 和 Stages。
 
+正式性能测试已经确认模板正确时，可关闭正确性校验及其数据准备/拷贝：
+
+```bash
+./build_gemm.sh --arch sm_89 --optimal-only --skip-verification
+```
+
+该模式直接在 Device 端清零 A/B/C，跳过 Host 随机初始化和 H2D、reference 张量、reference GEMM、reference/D 输出的 D2H 以及 `TensorEquals`。结果显示 `verification: disabled` 和 `Status: Not verified`。内存分配、kernel 初始化、一次 warmup 和正式 iterations 仍会执行。默认不加该选项时继续进行完整校验。
+
 指定 `nvcc` 路径：
 
 ```bash

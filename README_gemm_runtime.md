@@ -106,6 +106,14 @@ bash build_gemm.sh --arch sm_89 --optimal-only
 
 命中 `examples/gemm/optimal_configurations.inc` 中的精确 `M/N/K` 时只执行对应最优模板；未命中时确定性地伪随机选择一个合法模板，同一 shape 的选择可复现。后续增加最优 shape 时只需向 `.inc` 添加 `GEMM_OPTIMAL_ENTRY(...)` 并重新 build。
 
+已确认模板正确后，可关闭 reference 和结果校验以减少整用例耗时：
+
+```bash
+bash build_gemm.sh --arch sm_89 --optimal-only --skip-verification
+```
+
+关闭后直接在 Device 端清零 A/B/C，不执行 Host 随机初始化/H2D、reference GEMM、校验相关 D2H 和 `TensorEquals`；输出为 `verification: disabled`、`Status: Not verified`。默认 build 仍保留完整正确性校验。
+
 GEMM 可执行文件为：
 
 ```text
