@@ -66,10 +66,20 @@ def stage_spec(stage_id: int) -> tuple[int, int, str]:
 def alignment(m: int, k: int) -> tuple[int, int, int, bool]:
     if m == 1:
         return 8, 8, 8, True
-    if m % 8 == 0 and k % 8 == 0: return 8, 8, 8, True
-    if m % 4 == 0 and k % 8 == 0: return 4, 8, 4, True
-    if m % 2 == 0 and k % 8 == 0: return 2, 8, 2, True
-    return 1, 1, 1, False
+
+    def maximum_alignment(extent: int) -> int:
+        for candidate in (8, 4, 2):
+            if extent % candidate == 0:
+                return candidate
+        return 1
+
+    # ColumnMajor A/C are contiguous in M; ColumnMajor B is contiguous in K.
+    alignment_a = maximum_alignment(m)
+    alignment_b = maximum_alignment(k)
+    alignment_c = alignment_a
+    return alignment_a, alignment_b, alignment_c, (
+        alignment_a >= 2 and alignment_b >= 2
+    )
 
 
 def parse_log(path: Path) -> dict[tuple[int,int,int], dict[str,str]]:

@@ -12,6 +12,7 @@ cutlass/
 ├── build_gemm.sh
 ├── run_gemm.sh
 ├── collect_gemm_results.py
+├── estimate_qwen_gemm.py
 ├── gemm_performance_comparison.xlsx
 ├── include/
 ├── tools/
@@ -130,7 +131,7 @@ bash run_gemm.sh --model 7b --stage decode
 Decode 默认上下文长度：
 
 ```text
-128, 256, 512, 1024, 2048
+128, 129, 130, 131, 133, 137, 256, 257, 512, 513, 1024, 1025, 2048, 2049
 ```
 
 只运行 Prefill：
@@ -145,7 +146,9 @@ Prefill 默认序列长度：
 128, 256, 512, 1024, 2048, 129, 130, 132, 136
 ```
 
-Qwen2.5-7B 默认包含 14 个唯一 Decode GEMM 和 62 个唯一 Prefill GEMM。相同 `M/N/K` 的来源算子会合并，只执行一次；`MLP Up` 与 `MLP Gate` 均采用 `N=I`，并作为相同 shape 合并统计。
+默认 Decode 列表同时覆盖常用 L 边界和各默认 Prefill `S` 的首次 Decode `L=S+1`。Qwen2.5-7B 默认包含 32 个唯一 Decode GEMM 和 54 个唯一 Prefill GEMM；跨阶段全局去重后共 85 个。相同 `M/N/K` 的来源算子会合并，只执行一次；`Q/Attention Out`、`K/V`、`MLP Up/MLP Gate` 在整模型估算时仍分别计两次调用。Prefill LM Head 只计算最后位置，固定为 `M=1`，并与 Decode LM Head 共用同一 shape。
+
+本测试以 Batch=1、无融合、普通 GEMM Attention、FP16 A/B/C 与 FP16 累加来近似 BF16 推理的 GEMM-only 下界，不包含 softmax、mask、RMSNorm、RoPE、激活、残差、KV 管理和 kernel 间隙。
 
 ## 支持的模型
 
@@ -221,7 +224,7 @@ Threadblock 128x64x32， Warp 64x32x32
 Threadblock 64x256x32， Warp 32x64x32
 ```
 
-对齐的较大 M 用例使用 alignment `8/8/8`、Stages 3。非对齐用例不做 padding，使用 alignment `1/1/1`、同步双缓冲 Stages 2。
+ColumnMajor 用例中 A/C 按 M、B 按 K 独立选择最大合法 alignment 8/4/2/1，不做 padding。例如 M 只能对齐到4而 K 能对齐到8时使用 `4/8/4`。A 或 B 任一侧为 alignment 1 时使用同步 Stages 2，否则大 M 使用 Stages 3。默认 Prefill S=129/130/132 覆盖 alignment 1/2/4。
 
 ## 输出
 
@@ -241,6 +244,86 @@ Best configuration: ...
   avg_time: ... ms
   gflops: ...
 ```
+
+## 汇总 GEMM-only 模型估算
+
+用目标长度的运行日志累加各 GEMM 最佳 `avg_time`：
+
+```bash
+bash run_gemm.sh --model 7b --stage prefill --lengths 128 | tee cutlass_prefill.log
+python3 estimate_qwen_gemm.py --log cutlass_prefill.log --model 7b --stage prefill --length 128
+
+bash run_gemm.sh --model 7b --stage decode --lengths 129 | tee cutlass_decode.log
+python3 estimate_qwen_gemm.py --log cutlass_decode.log --model 7b --stage decode --length 129
+```
+
+Prompt 长度为 `P` 时，Prefill 使用 `S=P`，下一次 Decode forward 使用 `L=P+1`。脚本按 Qwen2.5 模型层数汇总，对 Q/Out、K/V、Up/Gate 各计两次，LM Head 只计一次。整模型延迟应累加 `avg_time × 调用次数`，不能平均各用例 GFLOPS。
+
+### 一个 forward 的估算范围
+
+- Prefill `--length S` 表示一次处理全部 S 个 prompt token 的 forward，并由最后位置 LM Head 产生第一个输出 token。
+- Decode `--length L` 表示一次读取长度为 L 的 KV Cache、产生一个新 token 的 forward。
+
+单个 forward 的 GEMM-only 时间为：
+
+```text
+num_layers * (
+    2*T(Q/Out) + 2*T(K/V) + T(QK^T) + T(PV)
+  + 2*T(Up/Gate) + T(Down)
+) + T(LM_Head_M1)
+```
+
+所有 `T(shape)` 均读取日志中的实测最佳 `avg_time`。当前脚本严格要求日志包含全部所需 shape；缺失时直接报错，不使用理论峰值、FLOPs 比例、插值或外推。
+
+若 `S=128、G=128`，并且 G 包含 Prefill 产生的第一个 token，则完整生成过程为 Prefill `S=128` 加 Decode `L=129...255` 共127次：
+
+```text
+T_total = T_prefill(128) + sum(T_decode(L), L=129...255)
+```
+
+当前脚本一次只估算一个 forward，尚不自动循环和累加整个 `S/G` 区间。
+
+### 基于全量实测数据估算 S/G
+
+以下示例估算 Qwen2.5-7B 的 `S=128、G=128`。G 包含 Prefill 产生的第一个 token，所以 Decode 共127次，KV长度为 `L=129...255`：
+
+```bash
+MODEL=7b
+S=128
+G=128
+FIRST_L=$((S + 1))
+LAST_L=$((S + G - 1))
+DECODE_LENGTHS=$(seq -s, "$FIRST_L" "$LAST_L")
+
+bash run_gemm.sh --model "$MODEL" --stage prefill --lengths "$S" \
+  | tee "prefill_s${S}.log"
+
+bash run_gemm.sh --model "$MODEL" --stage decode --lengths "$DECODE_LENGTHS" \
+  | tee "decode_s${S}_g${G}.log"
+```
+
+累加每个 forward 的实测最佳时间：
+
+```bash
+PREFILL_MS=$(
+  python3 estimate_qwen_gemm.py --log "prefill_s${S}.log" \
+    --model "$MODEL" --stage prefill --length "$S" \
+  | awk '/GEMM-only lower-bound latency:/ {print $4}'
+)
+
+DECODE_MS=$(
+  for L in $(seq "$FIRST_L" "$LAST_L"); do
+    python3 estimate_qwen_gemm.py --log "decode_s${S}_g${G}.log" \
+      --model "$MODEL" --stage decode --length "$L"
+  done \
+  | awk '/GEMM-only lower-bound latency:/ {sum += $4} END {printf "%.6f", sum}'
+)
+
+awk -v prefill="$PREFILL_MS" -v decode="$DECODE_MS" \
+  'BEGIN {printf "Total GEMM-only: %.6f ms\n", prefill + decode}'
+```
+
+该方法要求日志覆盖每一个 L，不进行插值。`G=1` 时只运行 Prefill；若 G 表示 Prefill 之后额外生成的 token 数，则 Decode 范围改为 `L=S+1...S+G`。
 
 ## 回填性能对比表
 
@@ -285,5 +368,5 @@ python3 collect_gemm_results.py \
 - `M=1` 时 A/C使用 RowMajor，B使用 ColumnMajor；A/B/C alignment 为 `8/8/8`。
 - `M>1` 时 A/B/C使用 ColumnMajor。
 - alignment=1 的 FP16 访问为2字节，不能使用 SM80 `cp.async`，因此固定采用同步 `MmaPipelined` Stages 2。
-- LM Head 和部分 MLP 用例需要较大的主机内存与 GPU显存。
+- LM Head 固定使用 `M=1`，只计算最后位置 logits；部分 MLP 用例仍需要较大的主机内存与 GPU显存。
 - 更换 GPU、CUDA版本或 `.inc` 后必须重新执行 build。

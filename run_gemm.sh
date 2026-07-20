@@ -98,7 +98,9 @@ fi
 
 case "$stage" in
   decode)
-    [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048"
+    # Include the original L boundaries and first-decode L=S+1 for every
+    # default Prefill prompt length.
+    [[ -n "$lengths_csv" ]] || lengths_csv="128,129,130,131,133,137,256,257,512,513,1024,1025,2048,2049"
     ;;
   prefill)
     [[ -n "$lengths_csv" ]] || lengths_csv="128,256,512,1024,2048,129,130,132,136"
@@ -195,7 +197,8 @@ shape_for_prefill_op() {
     "Attention Out")  m=$token_m;     n=$h;                      k=$h ;;
     "MLP Up"|"MLP Gate") m=$token_m; n=$intermediate; k=$h ;;
     "MLP Down")       m=$token_m;     n=$h;                      k=$intermediate ;;
-    "LM Head")        m=$token_m;     n=$vocab;                  k=$h ;;
+    # Prefill only materializes logits for the final prompt position.
+    "LM Head")        m=$batch;       n=$vocab;                  k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
   esac
 }
@@ -247,11 +250,15 @@ if [[ "$stage" == "decode" ]]; then
 else
   # In Prefill, S participates in token M and attention M/N/K.
   for sequence_length in "${lengths[@]}"; do
-    for operation in "${base_operations[@]}" "${attention_operations[@]}"; do
+    for operation in "${base_operations[@]:0:7}" "${attention_operations[@]}"; do
       shape_for_prefill_op "$operation" "$sequence_length"
       add_unique_case "$operation" "$sequence_length"
     done
   done
+  # LM Head is outside the transformer-layer loop and only consumes the final
+  # hidden state, so it is independent of S and is benchmarked exactly once.
+  shape_for_prefill_op "LM Head" 1
+  add_unique_case "LM Head (last token only)" "-"
 fi
 
 total_cases=${#case_m[@]}

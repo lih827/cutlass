@@ -17,8 +17,9 @@ PRESETS = {
     "32b": (5120, 40, 8, 128, 27648, 152064),
     "72b": (8192, 64, 8, 128, 29568, 152064),
 }
-DECODE_LENGTHS = (128, 256, 512, 1024, 2048)
 PREFILL_LENGTHS = (128, 256, 512, 1024, 2048, 129, 130, 132, 136)
+DECODE_LENGTHS = tuple(sorted({128, 256, 512, 1024, 2048,
+                               *(length + 1 for length in PREFILL_LENGTHS)}))
 
 
 def parse_models(value: str) -> list[str]:
@@ -49,7 +50,7 @@ def enumerate_shapes(models: list[str], batch: int):
             "K / V": (token_m, kv_heads * head_dim, h),
             "MLP Up / MLP Gate": (token_m, intermediate, h),
             "MLP Down": (token_m, h, intermediate),
-            "LM Head": (token_m, vocab, h),
+            "LM Head (last token only)": (token_m, vocab, h),
         }
         for operation, shape in base.items():
             add(records, shape, model, "Decode", operation, "-")
@@ -64,12 +65,14 @@ def enumerate_shapes(models: list[str], batch: int):
                 "K / V": (token_m, kv_heads * head_dim, h),
                 "MLP Up / MLP Gate": (token_m, intermediate, h),
                 "MLP Down": (token_m, h, intermediate),
-                "LM Head": (token_m, vocab, h),
                 "Attention QK^T": (attention_m, length, head_dim),
                 "Attention PV": (attention_m, head_dim, length),
             }
             for operation, shape in prefill.items():
                 add(records, shape, model, "Prefill", operation, length)
+        # Only the final prompt position produces logits. This is the same
+        # M=1 GEMM as Decode LM Head and is globally deduplicated with it.
+        add(records, (batch, vocab, h), model, "Prefill", "LM Head (last token only)", "-")
     return records
 
 

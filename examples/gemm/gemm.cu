@@ -75,7 +75,6 @@ using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 constexpr int kAlignmentAM1 = 8;
 constexpr int kAlignmentBM1 = 8;
 constexpr int kAlignmentCM1 = 8;
-constexpr int kAlignmentBAttention = 8;
 
 template <typename LayoutA, typename LayoutB, typename LayoutC,
           int kAlignmentA, int kAlignmentB, int kAlignmentC,
@@ -1013,6 +1012,101 @@ int profile_cublaslt_generated_candidate(Options const &) {
 }
 #endif
 
+int maximum_fp16_alignment(int extent) {
+  if (extent % 8 == 0) return 8;
+  if (extent % 4 == 0) return 4;
+  if (extent % 2 == 0) return 2;
+  return 1;
+}
+
+template <int kAlignmentA>
+int profile_large_m_by_alignment_b(Options const &options, int alignment_b) {
+#define DISPATCH_LARGE_M(ALIGN_B)                                             \
+  return profile_large_m_candidates<                                         \
+      LayoutAAttention, LayoutBAttention, LayoutCAttention,                   \
+      kAlignmentA, ALIGN_B, kAlignmentA,                                     \
+      (kAlignmentA == 1 || ALIGN_B == 1) ? 2 : 3>(options)
+  switch (alignment_b) {
+    case 8: DISPATCH_LARGE_M(8);
+    case 4: DISPATCH_LARGE_M(4);
+    case 2: DISPATCH_LARGE_M(2);
+    default: DISPATCH_LARGE_M(1);
+  }
+#undef DISPATCH_LARGE_M
+}
+
+int profile_large_m_by_alignment(Options const &options) {
+  int alignment_a = maximum_fp16_alignment(options.m);
+  int alignment_b = maximum_fp16_alignment(options.k);
+  switch (alignment_a) {
+    case 8: return profile_large_m_by_alignment_b<8>(options, alignment_b);
+    case 4: return profile_large_m_by_alignment_b<4>(options, alignment_b);
+    case 2: return profile_large_m_by_alignment_b<2>(options, alignment_b);
+    default: return profile_large_m_by_alignment_b<1>(options, alignment_b);
+  }
+}
+
+template <int kAlignmentA>
+int profile_small_m_by_alignment_b(Options const &options, int alignment_b) {
+#define DISPATCH_SMALL_M(ALIGN_B)                                             \
+  return profile_all_candidates<                                             \
+      LayoutAAttention, LayoutBAttention, LayoutCAttention,                   \
+      kAlignmentA, ALIGN_B, kAlignmentA>(options)
+  // Alignment 1 cannot use the cp.async candidates in profile_all_candidates.
+  if constexpr (kAlignmentA == 1) {
+    return profile_large_m_by_alignment_b<kAlignmentA>(options, alignment_b);
+  } else {
+    if (alignment_b == 1) {
+      return profile_large_m_by_alignment_b<kAlignmentA>(options, alignment_b);
+    }
+    switch (alignment_b) {
+      case 8: DISPATCH_SMALL_M(8);
+      case 4: DISPATCH_SMALL_M(4);
+      default: DISPATCH_SMALL_M(2);
+    }
+  }
+#undef DISPATCH_SMALL_M
+}
+
+int profile_small_m_by_alignment(Options const &options) {
+  int alignment_a = maximum_fp16_alignment(options.m);
+  int alignment_b = maximum_fp16_alignment(options.k);
+  switch (alignment_a) {
+    case 8: return profile_small_m_by_alignment_b<8>(options, alignment_b);
+    case 4: return profile_small_m_by_alignment_b<4>(options, alignment_b);
+    case 2: return profile_small_m_by_alignment_b<2>(options, alignment_b);
+    default: return profile_small_m_by_alignment_b<1>(options, alignment_b);
+  }
+}
+
+template <int kAlignmentA, bool kLargeM>
+int profile_unmapped_by_alignment_b(Options const &options, int alignment_b) {
+#define DISPATCH_UNMAPPED(ALIGN_B)                                            \
+  return profile_unmapped_single_candidate<                                  \
+      LayoutAAttention, LayoutBAttention, LayoutCAttention,                   \
+      kAlignmentA, ALIGN_B, kAlignmentA,                                     \
+      (kAlignmentA == 1 || ALIGN_B == 1) ? 2 : (kLargeM ? 3 : 2)>(options)
+  switch (alignment_b) {
+    case 8: DISPATCH_UNMAPPED(8);
+    case 4: DISPATCH_UNMAPPED(4);
+    case 2: DISPATCH_UNMAPPED(2);
+    default: DISPATCH_UNMAPPED(1);
+  }
+#undef DISPATCH_UNMAPPED
+}
+
+template <bool kLargeM>
+int profile_unmapped_by_alignment(Options const &options) {
+  int alignment_a = maximum_fp16_alignment(options.m);
+  int alignment_b = maximum_fp16_alignment(options.k);
+  switch (alignment_a) {
+    case 8: return profile_unmapped_by_alignment_b<8, kLargeM>(options, alignment_b);
+    case 4: return profile_unmapped_by_alignment_b<4, kLargeM>(options, alignment_b);
+    case 2: return profile_unmapped_by_alignment_b<2, kLargeM>(options, alignment_b);
+    default: return profile_unmapped_by_alignment_b<1, kLargeM>(options, alignment_b);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char const **argv) {
@@ -1069,34 +1163,10 @@ int main(int argc, char const **argv) {
       return profile_unmapped_single_candidate<
           LayoutAM1, LayoutBM1, LayoutCM1, 8, 8, 8, 4>(options);
     }
-    if (options.m >= 128) {
-      if (options.m % 8 == 0 && options.k % 8 == 0) {
-        return profile_unmapped_single_candidate<
-            LayoutAAttention, LayoutBAttention, LayoutCAttention,
-            8, 8, 8, 3>(options);
-      }
-      return profile_unmapped_single_candidate<
-          LayoutAAttention, LayoutBAttention, LayoutCAttention,
-          1, 1, 1, 2>(options);
-    }
-    if (options.m % 2 != 0 || options.k % 8 != 0) {
-      return profile_unmapped_single_candidate<
-          LayoutAAttention, LayoutBAttention, LayoutCAttention,
-          1, 1, 1, 2>(options);
-    }
-    if (options.m % 8 == 0) {
-      return profile_unmapped_single_candidate<
-          LayoutAAttention, LayoutBAttention, LayoutCAttention,
-          8, 8, 8, 2>(options);
-    }
-    if (options.m % 4 == 0) {
-      return profile_unmapped_single_candidate<
-          LayoutAAttention, LayoutBAttention, LayoutCAttention,
-          4, 8, 4, 2>(options);
-    }
-    return profile_unmapped_single_candidate<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        2, 8, 2, 2>(options);
+    // The optimal-only fallback shares the same independent A/C-versus-B
+    // alignment dispatch as the full candidate path below.
+    return options.m >= 128 ? profile_unmapped_by_alignment<true>(options)
+                            : profile_unmapped_by_alignment<false>(options);
   }
 
   // A generated exact-shape template takes precedence. A return value of -1
@@ -1109,38 +1179,6 @@ int main(int argc, char const **argv) {
         LayoutAM1, LayoutBM1, LayoutCM1,
         kAlignmentAM1, kAlignmentBM1, kAlignmentCM1>(options);
   }
-  if (options.m >= 128) {
-    if (options.m % 8 == 0 && options.k % 8 == 0) {
-      return profile_large_m_candidates<
-          LayoutAAttention, LayoutBAttention, LayoutCAttention,
-          8, 8, 8, 3>(options);
-    }
-    // FP16 Alignment=1 is a 2-byte access, which is unsupported by cp.async.
-    // Stages=2 selects CUTLASS's synchronous MmaPipelined mainloop, so the
-    // original (unpadded) dimensions can be processed with scalar accesses.
-    return profile_large_m_candidates<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        1, 1, 1, 2>(options);
-  }
-  if (options.m % 2 != 0 || options.k % 8 != 0) {
-    return profile_large_m_candidates<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        1, 1, 1, 2>(options);
-  }
-  if (options.m % 8 == 0) {
-    return profile_all_candidates<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        8, kAlignmentBAttention, 8>(options);
-  }
-  if (options.m % 4 == 0) {
-    return profile_all_candidates<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        4, kAlignmentBAttention, 4>(options);
-  }
-  if (options.m % 2 == 0) {
-    return profile_all_candidates<
-        LayoutAAttention, LayoutBAttention, LayoutCAttention,
-        2, kAlignmentBAttention, 2>(options);
-  }
-  return EXIT_FAILURE;
+  return options.m >= 128 ? profile_large_m_by_alignment(options)
+                          : profile_small_m_by_alignment(options);
 }

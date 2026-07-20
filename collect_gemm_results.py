@@ -174,8 +174,8 @@ def update_workbook(template: Path, output: Path, results: list[ParsedResult]) -
 
     for result in results:
         row = shape_rows[result.shape]
-        sheet.cell(row, 1).value = result.sequence_label
-        sheet.cell(row, 2).value = result.source_operations
+        # A/B are static shape provenance in the globally deduplicated template.
+        # Do not overwrite a Decode+Prefill label when one stage is collected.
         sheet.cell(row, 6).value = result.best_configuration
         sheet.cell(row, 7).value = result.gflops
 
