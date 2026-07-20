@@ -2,3 +2,5 @@
 __pycache__/
 cutlass_library.egg-info/
 /build*
+/optimal_tuning/
+/examples/gemm/cublaslt_generated_candidates.inc

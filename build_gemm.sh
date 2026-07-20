@@ -102,6 +102,7 @@ fi
 if ((optimal_only == 1)); then
   extra_nvcc_flags+=("-DGEMM_OPTIMAL_ONLY=1")
   echo "Candidate mode: optimal-only for mapped shapes"
+  echo "Optimal source: examples/gemm/optimal_configurations.inc"
 else
   echo "Candidate mode: compare all applicable candidates"
 fi

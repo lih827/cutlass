@@ -134,6 +134,8 @@ def main() -> int:
             f"        cutlass::gemm::GemmShape<{wm}, {wn}, {wk}>, {stages}>(\"{name}\", {split_k}, options);\n"
             f"  }}")
         rows.append({"m":m,"n":n,"k":k,"algo_id":fields["algo_id"],
+            "cublaslt_avg_time_ms":fields.get("avg_time_ms", ""),
+            "cublaslt_gflops":fields.get("gflops", ""),
             "cublaslt_tile_id":fields["tile_id"],"cublaslt_tile":f"{source[0]}x{source[1]}",
             "cublaslt_stages_id":fields["stages_id"],"cutlass_threadblock":f"{tbm}x{tbn}x{tbk}",
             "cutlass_warp":f"{wm}x{wn}x{wk}","cutlass_stages":stages,

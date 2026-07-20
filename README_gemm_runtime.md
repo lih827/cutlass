@@ -18,8 +18,7 @@ cutlass/
 └── examples/
     └── gemm/
         ├── gemm.cu
-        ├── cublaslt_generated_candidates.inc  # 可选
-        └── optimal_configurations.inc          # 最优模板映射
+        └── optimal_configurations.inc  # 可选的精确 M/N/K 最优映射
 ```
 
 `build_gemm.sh` 和 `run_gemm.sh` 必须从 CUTLASS 根目录执行。
@@ -41,22 +40,6 @@ Accumulator      = half
 OperatorClass    = OpClassTensorOp
 ArchTag          = Sm80
 InstructionShape = 16x8x16
-```
-
-## 可选配置文件
-
-`examples/gemm/cublaslt_generated_candidates.inc` 保存按精确 `M/N/K` 匹配的附加 CUTLASS 模板配置。
-
-- 文件存在且当前 `M/N/K` 有对应记录时：附加模板会与程序内置 CUTLASS 候选共同运行，最终按实测时间选择最佳项。
-- 文件不存在、内容为空或当前 shape 没有记录时：程序直接使用内置 CUTLASS 候选。
-- 附加模板无法运行或结果校验失败时：程序忽略该模板，继续使用内置候选。
-- `.inc` 只参与编译；生成可执行文件后，运行阶段不再读取它。
-
-因此 `.inc` 可有可无。需要明确使用内置候选时，可以删除该文件后重新编译：
-
-```bash
-rm -f examples/gemm/cublaslt_generated_candidates.inc
-bash build_gemm.sh --arch sm_89
 ```
 
 ## 编译
@@ -104,7 +87,7 @@ bash build_gemm.sh --arch sm_89 --timer chrono
 bash build_gemm.sh --arch sm_89 --optimal-only
 ```
 
-命中 `examples/gemm/optimal_configurations.inc` 中的精确 `M/N/K` 时只执行对应最优模板；未命中时确定性地伪随机选择一个合法模板，同一 shape 的选择可复现。后续增加最优 shape 时只需向 `.inc` 添加 `GEMM_OPTIMAL_ENTRY(...)` 并重新 build。
+`--optimal-only` 只读取 `examples/gemm/optimal_configurations.inc`。该文件可以是交付包自带配置，也可以替换为目标环境已经生成的同格式配置。命中精确 `M/N/K` 时只执行对应模板；文件不存在或 shape 未命中时确定性地选择 fallback。编译和运行过程本身不依赖任何配置生成程序。
 
 已确认模板正确后，可关闭 reference 和结果校验以减少整用例耗时：
 

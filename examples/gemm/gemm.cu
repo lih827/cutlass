@@ -555,6 +555,57 @@ void print_result(char const *configuration_name, Result const &result) {
             << "  gflops: " << result.gflops << "\n";
 }
 
+template <typename Gemm>
+void print_cutlass_record(char const *record_type, char const *source,
+                          char const *configuration_name,
+                          Options const &options, Result const &result) {
+  std::cout << std::fixed << std::setprecision(6)
+            << record_type
+            << " m=" << options.m << " n=" << options.n << " k=" << options.k
+            << " source=" << source << " name=" << configuration_name
+            << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
+            << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
+            << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
+            << " align_a=" << Gemm::kAlignmentA
+            << " align_b=" << Gemm::kAlignmentB
+            << " align_c=" << Gemm::kAlignmentC
+            << " tb_m=" << Gemm::ThreadblockShape::kM
+            << " tb_n=" << Gemm::ThreadblockShape::kN
+            << " tb_k=" << Gemm::ThreadblockShape::kK
+            << " warp_m=" << Gemm::WarpShape::kM
+            << " warp_n=" << Gemm::WarpShape::kN
+            << " warp_k=" << Gemm::WarpShape::kK
+            << " swizzle=" << ConfigName<typename Gemm::ThreadblockSwizzle>::value()
+            << " stages=" << Gemm::kStages
+            << " split_k=" << options.split_k_slices
+            << " valid=" << ((result.status == cutlass::Status::kSuccess && result.passed) ? 1 : 0)
+            << " avg_time_ms=" << result.avg_time_ms
+            << " gflops=" << result.gflops << "\n";
+}
+
+void print_generated_record(char const *record_type, Options const &options,
+                            Result const &result) {
+  auto const &g = generated_candidate_result;
+  std::cout << std::fixed << std::setprecision(6)
+            << record_type
+            << " m=" << options.m << " n=" << options.n << " k=" << options.k
+            << " source=cublaslt-derived name=" << g.name
+            << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
+            << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
+            << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
+            << " align_a=" << g.alignment_a << " align_b=" << g.alignment_b
+            << " align_c=" << g.alignment_c
+            << " tb_m=" << g.threadblock_m << " tb_n=" << g.threadblock_n
+            << " tb_k=" << g.threadblock_k
+            << " warp_m=" << g.warp_m << " warp_n=" << g.warp_n
+            << " warp_k=" << g.warp_k
+            << " swizzle=Identity stages=" << g.stages
+            << " split_k=" << g.split_k_slices
+            << " valid=" << ((result.status == cutlass::Status::kSuccess && result.passed) ? 1 : 0)
+            << " avg_time_ms=" << result.avg_time_ms
+            << " gflops=" << result.gflops << "\n";
+}
+
 void print_generated_configuration(Options const &options) {
   auto const &g = generated_candidate_result;
   std::cout << "\nGEMM configuration: " << g.name << "\n"
@@ -602,14 +653,17 @@ int profile_all_candidates(Options const &options) {
 
   if (!kConciseLog) print_configuration<Linear>(linear_name.c_str(), options);
   Result linear = run_tensorop_gemm<Linear>(options, tensors);
+  print_cutlass_record<Linear>("CUTLASS_CANDIDATE", "baseline", linear_name.c_str(), options, linear);
   if (!kConciseLog) print_result(linear_name.c_str(), linear);
 
   if (!kConciseLog) print_configuration<AttentionQK>(attention_qk_name.c_str(), options);
   Result attention_qk = run_tensorop_gemm<AttentionQK>(options, tensors);
+  print_cutlass_record<AttentionQK>("CUTLASS_CANDIDATE", "baseline", attention_qk_name.c_str(), options, attention_qk);
   if (!kConciseLog) print_result(attention_qk_name.c_str(), attention_qk);
 
   if (!kConciseLog) print_configuration<AttentionPV>(attention_pv_name.c_str(), options);
   Result attention_pv = run_tensorop_gemm<AttentionPV>(options, tensors);
+  print_cutlass_record<AttentionPV>("CUTLASS_CANDIDATE", "baseline", attention_pv_name.c_str(), options, attention_pv);
   if (!kConciseLog) print_result(attention_pv_name.c_str(), attention_pv);
 
   char const *best_configuration_name = nullptr;
@@ -666,6 +720,15 @@ int profile_all_candidates(Options const &options) {
   std::cout << "\nBest configuration: " << best_configuration_name << "\n"
             << "  avg_time: " << best_result->avg_time_ms << " ms\n"
             << "  gflops: " << best_result->gflops << "\n";
+  if (best_is_generated) {
+    print_generated_record("CUTLASS_BEST", options, *best_result);
+  } else if (best_result == &linear) {
+    print_cutlass_record<Linear>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else if (best_result == &attention_qk) {
+    print_cutlass_record<AttentionQK>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else {
+    print_cutlass_record<AttentionPV>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  }
   return EXIT_SUCCESS;
 }
 
@@ -707,26 +770,32 @@ int profile_large_m_candidates(Options const &options) {
 
   if (!kConciseLog) print_configuration<Tile128x128>(tile_128x128_name.c_str(), options);
   Result tile_128x128 = run_tensorop_gemm<Tile128x128>(options, tensors);
+  print_cutlass_record<Tile128x128>("CUTLASS_CANDIDATE", "baseline", tile_128x128_name.c_str(), options, tile_128x128);
   if (!kConciseLog) print_result(tile_128x128_name.c_str(), tile_128x128);
 
   if (!kConciseLog) print_configuration<Tile128x256>(tile_128x256_name.c_str(), options);
   Result tile_128x256 = run_tensorop_gemm<Tile128x256>(options, tensors);
+  print_cutlass_record<Tile128x256>("CUTLASS_CANDIDATE", "baseline", tile_128x256_name.c_str(), options, tile_128x256);
   if (!kConciseLog) print_result(tile_128x256_name.c_str(), tile_128x256);
 
   if (!kConciseLog) print_configuration<Tile256x128>(tile_256x128_name.c_str(), options);
   Result tile_256x128 = run_tensorop_gemm<Tile256x128>(options, tensors);
+  print_cutlass_record<Tile256x128>("CUTLASS_CANDIDATE", "baseline", tile_256x128_name.c_str(), options, tile_256x128);
   if (!kConciseLog) print_result(tile_256x128_name.c_str(), tile_256x128);
 
   if (!kConciseLog) print_configuration<Tile64x128>(tile_64x128_name.c_str(), options);
   Result tile_64x128 = run_tensorop_gemm<Tile64x128>(options, tensors);
+  print_cutlass_record<Tile64x128>("CUTLASS_CANDIDATE", "baseline", tile_64x128_name.c_str(), options, tile_64x128);
   if (!kConciseLog) print_result(tile_64x128_name.c_str(), tile_64x128);
 
   if (!kConciseLog) print_configuration<Tile128x64>(tile_128x64_name.c_str(), options);
   Result tile_128x64 = run_tensorop_gemm<Tile128x64>(options, tensors);
+  print_cutlass_record<Tile128x64>("CUTLASS_CANDIDATE", "baseline", tile_128x64_name.c_str(), options, tile_128x64);
   if (!kConciseLog) print_result(tile_128x64_name.c_str(), tile_128x64);
 
   if (!kConciseLog) print_configuration<Tile64x256>(tile_64x256_name.c_str(), options);
   Result tile_64x256 = run_tensorop_gemm<Tile64x256>(options, tensors);
+  print_cutlass_record<Tile64x256>("CUTLASS_CANDIDATE", "baseline", tile_64x256_name.c_str(), options, tile_64x256);
   if (!kConciseLog) print_result(tile_64x256_name.c_str(), tile_64x256);
 
   char const *best_configuration_name = nullptr;
@@ -781,6 +850,21 @@ int profile_large_m_candidates(Options const &options) {
   std::cout << "\nBest configuration: " << best_configuration_name << "\n"
             << "  avg_time: " << best_result->avg_time_ms << " ms\n"
             << "  gflops: " << best_result->gflops << "\n";
+  if (best_is_generated) {
+    print_generated_record("CUTLASS_BEST", options, *best_result);
+  } else if (best_result == &tile_128x128) {
+    print_cutlass_record<Tile128x128>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else if (best_result == &tile_128x256) {
+    print_cutlass_record<Tile128x256>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else if (best_result == &tile_256x128) {
+    print_cutlass_record<Tile256x128>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else if (best_result == &tile_64x128) {
+    print_cutlass_record<Tile64x128>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else if (best_result == &tile_128x64) {
+    print_cutlass_record<Tile128x64>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else {
+    print_cutlass_record<Tile64x256>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  }
   return EXIT_SUCCESS;
 }
 
@@ -790,19 +874,22 @@ template <typename LayoutA, typename LayoutB, typename LayoutC,
           int kAlignmentA, int kAlignmentB, int kAlignmentC,
           typename ThreadblockShape, typename WarpShape,
           typename ThreadblockSwizzle, int kStages>
-int profile_optimal_template(char const *family, Options const &options) {
+int profile_optimal_template(char const *family, Options const &options,
+                             int split_k_slices = 1) {
   using Gemm = GemmConfiguration<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
       ThreadblockShape, WarpShape, ThreadblockSwizzle, kStages>;
   using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
   std::string const name = make_configuration_name<Gemm>(family);
+  Options tuned_options = options;
+  tuned_options.split_k_slices = std::max(1, split_k_slices);
   TensorSet tensors;
-  if (!initialize_tensors(options, tensors) ||
-      (kVerifyResults && !compute_reference(options, tensors))) {
+  if (!initialize_tensors(tuned_options, tensors) ||
+      (kVerifyResults && !compute_reference(tuned_options, tensors))) {
     return EXIT_FAILURE;
   }
-  print_configuration<Gemm>(name.c_str(), options);
-  Result result = run_tensorop_gemm<Gemm>(options, tensors);
+  print_configuration<Gemm>(name.c_str(), tuned_options);
+  Result result = run_tensorop_gemm<Gemm>(tuned_options, tensors);
   print_result(name.c_str(), result);
   if (result.status != cutlass::Status::kSuccess || !result.passed) {
     return EXIT_FAILURE;
@@ -824,9 +911,21 @@ int profile_optimal_only_candidate(Options const &options) {
         cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(              \
             "Optimal", options);                                               \
   }
+#define GEMM_OPTIMAL_ENTRY_EX(M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C,           \
+                              ALIGN_A, ALIGN_B, ALIGN_C,                        \
+                              TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE,        \
+                              STAGES, SPLIT_K)                                  \
+  if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+    return profile_optimal_template<                                            \
+        LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
+        cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(              \
+            "Optimal", options, SPLIT_K);                                      \
+  }
 #if __has_include("optimal_configurations.inc")
 #include "optimal_configurations.inc"
 #endif
+#undef GEMM_OPTIMAL_ENTRY_EX
 #undef GEMM_OPTIMAL_ENTRY
   return -1;
 }
@@ -902,6 +1001,7 @@ int profile_cublaslt_template(char const *name, int split_k_slices,
   generated_candidate_result.alignment_b = kAlignmentB;
   generated_candidate_result.alignment_c = kAlignmentC;
   generated_candidate_result.split_k_slices = tuned_options.split_k_slices;
+  print_generated_record("CUTLASS_CANDIDATE", tuned_options, result);
   return -1;  // Always continue into the CUTLASS baseline candidate comparison.
 }
 
