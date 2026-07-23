@@ -37,11 +37,24 @@ cutlass/
 
 ```text
 Element A/B/C    = half
-Accumulator      = half
+Accumulator      = half（默认）或 float
 OperatorClass    = OpClassTensorOp
 ArchTag          = Sm80
 InstructionShape = 16x8x16
 ```
+
+选择累加类型（A/B/C/D 始终保持 FP16）：
+
+```bash
+bash build_gemm.sh --arch sm_89 --accumulator fp16
+bash build_gemm.sh --arch sm_89 --accumulator fp32
+```
+
+`--accumulator` 是编译选项，切换后必须重新编译。FP32 模式使用
+FP16 Tensor Core 输入、FP32 accumulator 和 FP32 epilogue compute，最终 D
+仍转换并写回 FP16。当前构建脚本正式支持 `fp16`、`fp32`；源码通过统一的
+`GEMM_ACCUMULATOR_TYPE` 类型入口组织，扩展其他类型时还必须确认输入类型、
+InstructionShape、OperatorClass 和目标架构支持该组合。
 
 ## 编译
 
@@ -88,7 +101,11 @@ bash build_gemm.sh --arch sm_89 --timer chrono
 bash build_gemm.sh --arch sm_89 --optimal-only
 ```
 
-`--optimal-only` 只读取 `examples/gemm/optimal_configurations.inc`。该文件可以是交付包自带配置，也可以替换为目标环境已经生成的同格式配置。命中精确 `M/N/K` 时只执行对应模板；文件不存在或 shape 未命中时确定性地选择 fallback。编译和运行过程本身不依赖任何配置生成程序。
+`--optimal-only` 只读取 `examples/gemm/optimal_configurations.inc`。映射按
+accumulator 类型与精确 `M/N/K` 联合匹配，不会把 FP16 最优模板直接用于
+FP32。文件不存在、累加器类型未调优或 shape 未命中时确定性地选择 fallback。
+交付包当前内置 FP16 实测映射；若要让 FP32 optimal-only 使用最优模板，需要
+在目标环境单独完成 FP32 调优并保留更新后的同一 `.inc` 文件。
 
 已确认模板正确后，可关闭 reference 和结果校验以减少整用例耗时：
 
@@ -148,7 +165,10 @@ Prefill 默认序列长度：
 
 默认 Decode 列表同时覆盖常用 L 边界和各默认 Prefill `S` 的首次 Decode `L=S+1`。Qwen2.5-7B 默认包含 32 个唯一 Decode GEMM 和 54 个唯一 Prefill GEMM；跨阶段全局去重后共 85 个。相同 `M/N/K` 的来源算子会合并，只执行一次；`Q/Attention Out`、`K/V`、`MLP Up/MLP Gate` 在整模型估算时仍分别计两次调用。Prefill LM Head 只计算最后位置，固定为 `M=1`，并与 Decode LM Head 共用同一 shape。
 
-本测试以 Batch=1、无融合、普通 GEMM Attention、FP16 A/B/C 与 FP16 累加来近似 BF16 推理的 GEMM-only 下界，不包含 softmax、mask、RMSNorm、RoPE、激活、残差、KV 管理和 kernel 间隙。
+本测试以 Batch=1、无融合、普通 GEMM Attention和 FP16 A/B/C/D 来近似 BF16
+推理的 GEMM-only 下界；累加类型由构建时的 `--accumulator fp16|fp32`
+决定。不包含 softmax、mask、RMSNorm、RoPE、激活、残差、KV 管理和
+kernel 间隙。
 
 ## 支持的模型
 
@@ -244,6 +264,16 @@ Best configuration: ...
   avg_time: ... ms
   gflops: ...
 ```
+
+失败时还会输出代码定位和CUDA错误：
+
+```text
+failure_stage: warmup_sync
+failure_location: examples/gemm/gemm.cu:...
+cuda_error: 700 (cudaErrorIllegalAddress: an illegal memory access was encountered)
+```
+
+成功时 `failure_stage=none`。常见阶段包括 `can_implement`、`initialize`、`warmup_launch`、`warmup_sync`、`timed_launch`、`event_record_*`、`event_sync_stop`、`chrono_*_sync`、`verification_copy` 和 `verification_compare`。若为 `preexisting_cuda_error`，说明前一个候选留下的异步CUDA错误直到当前候选开始前才被发现，应检查前一个候选配置。
 
 ## 汇总 GEMM-only 模型估算
 

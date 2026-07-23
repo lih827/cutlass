@@ -8,7 +8,8 @@ arch="sm_89"
 rounds=3
 iterations=100
 batch=1
-log_dir="optimal_tuning"
+accumulator="fp16"
+log_dir=""
 skip_validation=0
 
 usage() {
@@ -21,7 +22,8 @@ Usage: bash tune_optimal_cutlass.sh [options]
   --rounds N          CUTLASS measurement rounds (default: 3)
   --iterations N      Timed iterations per candidate (default: 100)
   --batch N           Decode/Prefill batch size (default: 1)
-  --log-dir DIR       Tuning artifacts directory (default: optimal_tuning)
+  --accumulator TYPE  fp16 or fp32 tuning and optimal mapping (default: fp16)
+  --log-dir DIR       Tuning artifacts directory (default: optimal_tuning/TYPE)
   --skip-validation   Do not run the final optimal-only coverage pass
   --help              Show this help
 EOF
@@ -34,12 +36,18 @@ while (($#)); do
     --rounds) rounds="$2"; shift 2 ;;
     --iterations) iterations="$2"; shift 2 ;;
     --batch) batch="$2"; shift 2 ;;
+    --accumulator) accumulator="$2"; shift 2 ;;
     --log-dir) log_dir="$2"; shift 2 ;;
     --skip-validation) skip_validation=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+[[ "$accumulator" == "fp16" || "$accumulator" == "fp32" ]] || {
+  echo "Unsupported accumulator: $accumulator (expected fp16 or fp32)" >&2
+  exit 2
+}
+[[ -n "$log_dir" ]] || log_dir="optimal_tuning/$accumulator"
 
 for value in "$rounds" "$iterations" "$batch"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "rounds, iterations, and batch must be positive integers" >&2; exit 2; }
@@ -75,7 +83,7 @@ if [[ -f "$optimal_inc" ]]; then cp "$optimal_inc" "$previous_optimal"; else rm 
 rm -f "$cublaslt_inc" "$optimal_inc" "$cublaslt_tmp" "$optimal_tmp"
 
 echo "[1/6] Build baseline CUTLASS and cuBLASLt profiler"
-"$bash_command" ./build_gemm.sh --arch "$arch" --concise-log --skip-verification
+"$bash_command" ./build_gemm.sh --arch "$arch" --accumulator "$accumulator" --concise-log --skip-verification
 
 run_manifest() {
   local backend="$1"
@@ -101,11 +109,12 @@ echo "[2/6] Profile actual cuBLASLt winners for $shape_count unique shapes"
 cublaslt_log="$log_dir/cublaslt_all.log"
 run_manifest "cublaslt" "$(pwd)/examples/gemm/cublaslt_profiler" "$cublaslt_log" "no"
 "$python_command" generate_cutlass_candidates.py \
-  --log "$cublaslt_log" --output "$cublaslt_tmp" --report "$cublaslt_report"
+  --log "$cublaslt_log" --output "$cublaslt_tmp" --report "$cublaslt_report" \
+  --accumulator "$accumulator"
 mv "$cublaslt_tmp" "$cublaslt_inc"
 
 echo "[3/6] Build CUTLASS with baseline and cuBLASLt-derived candidates"
-"$bash_command" ./build_gemm.sh --arch "$arch" --concise-log --skip-verification
+"$bash_command" ./build_gemm.sh --arch "$arch" --accumulator "$accumulator" --concise-log --skip-verification
 
 echo "[4/6] Measure every CUTLASS candidate for $rounds rounds"
 cutlass_log_args=()
@@ -125,9 +134,10 @@ echo "[5/6] Generate target-specific optimal mapping and rebuild"
   "${cutlass_log_args[@]}" --manifest "$manifest" \
   --cublaslt-report "$cublaslt_report" --output "$optimal_tmp" \
   --report "$optimal_report" --metadata "$metadata" --models "$models" \
-  --gpu "$gpu_name" --cuda "$cuda_version" --arch "$arch"
+  --gpu "$gpu_name" --cuda "$cuda_version" --arch "$arch" \
+  --accumulator "$accumulator" --existing-optimal "$previous_optimal"
 mv "$optimal_tmp" "$optimal_inc"
-"$bash_command" ./build_gemm.sh --arch "$arch" --optimal-only --concise-log --skip-verification
+"$bash_command" ./build_gemm.sh --arch "$arch" --accumulator "$accumulator" --optimal-only --concise-log --skip-verification
 
 if ((skip_validation == 0)); then
   echo "[6/6] Validate complete optimal-only coverage"

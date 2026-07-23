@@ -15,6 +15,18 @@
 #define LT_CHECK(x) do { auto s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { \
   std::cerr << "cuBLASLt error: " << int(s_) << "\n"; return 1; } } while (0)
 
+#if defined(GEMM_CUBLASLT_FP32_ACCUMULATOR) && GEMM_CUBLASLT_FP32_ACCUMULATOR
+using ScaleType = float;
+constexpr cublasComputeType_t kComputeType = CUBLAS_COMPUTE_32F;
+constexpr cudaDataType_t kScaleType = CUDA_R_32F;
+constexpr char const *kAccumulatorName = "float";
+#else
+using ScaleType = __half;
+constexpr cublasComputeType_t kComputeType = CUBLAS_COMPUTE_16F;
+constexpr cudaDataType_t kScaleType = CUDA_R_16F;
+constexpr char const *kAccumulatorName = "half";
+#endif
+
 template <typename T>
 int get_config(cublasLtMatmulAlgo_t const &algo,
                cublasLtMatmulAlgoConfigAttributes_t attribute, T &value) {
@@ -57,7 +69,7 @@ int main(int argc, char **argv) {
   cublasLtHandle_t lt{}; cublasLtMatmulDesc_t op{};
   cublasLtMatrixLayout_t ad{}, bd{}, cd{}, dd{}; cublasLtMatmulPreference_t pref{};
   LT_CHECK(cublasLtCreate(&lt));
-  LT_CHECK(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_16F, CUDA_R_16F));
+  LT_CHECK(cublasLtMatmulDescCreate(&op, kComputeType, kScaleType));
   cublasOperation_t trans = CUBLAS_OP_N;
   LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
   LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &trans, sizeof(trans)));
@@ -76,7 +88,7 @@ int main(int argc, char **argv) {
       lt, op, ad, bd, cd, dd, pref, requested, heuristics.data(), &returned));
   if (!returned) { std::cerr << "No cuBLASLt heuristic candidate\n"; return 1; }
 
-  __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+  ScaleType alpha = ScaleType(1.0f), beta = ScaleType(0.0f);
   cudaEvent_t start{}, stop{}; CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
   float best_ms = std::numeric_limits<float>::max(); int best = -1;
   for (int i = 0; i < returned; ++i) {
@@ -106,6 +118,7 @@ int main(int argc, char **argv) {
   double gflops = 2.0 * double(m) * n * k / (double(best_ms) * 1.0e6);
   std::cout << std::fixed << std::setprecision(4)
             << "CUBLASLT_BEST m=" << m << " n=" << n << " k=" << k
+            << " accumulator=" << kAccumulatorName
             << " algo_id=" << algo_id << " tile_id=" << tile_id
             << " stages_id=" << stages_id << " split_k=" << split_k
             << " reduction=" << reduction << " swizzle=" << swizzle

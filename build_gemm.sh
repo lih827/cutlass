@@ -6,6 +6,7 @@ arch="sm_89"
 nvcc_command="${NVCC:-nvcc}"
 concise_log=0
 timer="cuda-event"
+accumulator="fp16"
 optimal_only=0
 skip_verification=0
 
@@ -21,6 +22,7 @@ Options:
   --nvcc PATH       nvcc executable (default: $NVCC or nvcc)
   --concise-log     Compile gemm to print only the winning candidate details
   --timer TIMER     cuda-event or chrono (default: cuda-event)
+  --accumulator TYPE  fp16 or fp32 accumulation (default: fp16)
   --optimal-only    Run one preselected template for mapped exact M/N/K shapes
   --skip-verification  Skip reference GEMM, result copies, and comparison
   --help            Show this help
@@ -48,6 +50,11 @@ while (($# > 0)); do
       timer="$2"
       shift 2
       ;;
+    --accumulator)
+      [[ $# -ge 2 ]] || { echo "Missing value for --accumulator" >&2; exit 2; }
+      accumulator="$2"
+      shift 2
+      ;;
     --optimal-only)
       optimal_only=1
       shift
@@ -70,6 +77,11 @@ done
 
 [[ "$timer" == "cuda-event" || "$timer" == "chrono" ]] || {
   echo "Unsupported timer: $timer (expected cuda-event or chrono)" >&2
+  exit 2
+}
+
+[[ "$accumulator" == "fp16" || "$accumulator" == "fp32" ]] || {
+  echo "Unsupported accumulator: $accumulator (expected fp16 or fp32)" >&2
   exit 2
 }
 
@@ -96,6 +108,13 @@ echo "Source: $source_file"
 echo "Output: $output_file"
 
 extra_nvcc_flags=()
+if [[ "$accumulator" == "fp32" ]]; then
+  extra_nvcc_flags+=("-DGEMM_ACCUMULATOR_TYPE=float")
+fi
+cublaslt_nvcc_flags=()
+if [[ "$accumulator" == "fp32" ]]; then
+  cublaslt_nvcc_flags+=("-DGEMM_CUBLASLT_FP32_ACCUMULATOR=1")
+fi
 if [[ "$timer" == "chrono" ]]; then
   extra_nvcc_flags+=("-DGEMM_USE_CHRONO=1")
 fi
@@ -113,6 +132,7 @@ else
   echo "Verification: enabled"
 fi
 echo "Timer: $timer"
+echo "Accumulator: $accumulator (A/B/C/D remain fp16)"
 if ((concise_log == 1)); then
   extra_nvcc_flags+=("-DGEMM_CONCISE_LOG=1")
   echo "Log mode: concise (winning configuration only)"
@@ -134,6 +154,7 @@ echo "Build succeeded: $output_file"
 
 if [[ -f "$cublaslt_source" ]]; then
   "$nvcc_command" -std=c++17 -arch="$arch" "$cublaslt_source" \
+    "${cublaslt_nvcc_flags[@]}" \
     -lcublasLt -lcublas -o "$cublaslt_output"
   chmod +x "$cublaslt_output"
   echo "Build succeeded: $cublaslt_output"

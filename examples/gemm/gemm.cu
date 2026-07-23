@@ -1,8 +1,8 @@
 /***************************************************************************************************
  * TensorOp GEMM configuration comparison example.
  *
- * Computes D = alpha * A * B + beta * C with half precision inputs,
- * half precision accumulation, and half precision output.
+ * Computes D = alpha * A * B + beta * C with half precision A/B/C/D
+ * and a build-time selectable accumulator type.
  **************************************************************************************************/
 
 #include <cuda_runtime.h>
@@ -14,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -57,8 +58,16 @@ constexpr bool kVerifyResults = true;
 using ElementA = cutlass::half_t;
 using ElementB = cutlass::half_t;
 using ElementC = cutlass::half_t;
-using ElementAccumulator = cutlass::half_t;
-using ElementCompute = cutlass::half_t;
+
+#if !defined(GEMM_ACCUMULATOR_TYPE)
+#define GEMM_ACCUMULATOR_TYPE cutlass::half_t
+#endif
+
+// Keep the selected type in one alias so another accumulator can be added by
+// passing a CUTLASS-compatible C++ type at build time. The instruction shape,
+// operator class, input types, and target architecture must also support it.
+using ElementAccumulator = GEMM_ACCUMULATOR_TYPE;
+using ElementCompute = ElementAccumulator;
 
 using LayoutAM1 = cutlass::layout::RowMajor;
 using LayoutBM1 = cutlass::layout::ColumnMajor;
@@ -115,6 +124,17 @@ using AttentionPVStreamKGemm = GemmConfiguration<
     cutlass::gemm::GemmShape<16, 64, 32>,
     cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 4>;
 
+// FP32 accumulation can increase register pressure. This compact identity
+// candidate is measured only in FP32 builds instead of assuming the FP16
+// skinny-M winner remains optimal.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC>
+using Fp32CompactGemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<32, 128, 32>,
+    cutlass::gemm::GemmShape<16, 64, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+
 // Prefill candidates: large M/N grids already provide abundant parallelism,
 // so use larger CTA tiles and the identity swizzle.
 template <typename LayoutA, typename LayoutB, typename LayoutC,
@@ -165,6 +185,14 @@ using LargeM64x256Gemm = GemmConfiguration<
     cutlass::gemm::GemmShape<32, 64, 32>,
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
 
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC, int kStages>
+using Fp32LargeM64x64Gemm = GemmConfiguration<
+    LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<32, 32, 32>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, kStages>;
+
 template <typename T>
 struct ConfigName {
   static char const *value() { return "unknown"; }
@@ -173,6 +201,11 @@ struct ConfigName {
 template <>
 struct ConfigName<cutlass::half_t> {
   static char const *value() { return "half"; }
+};
+
+template <>
+struct ConfigName<float> {
+  static char const *value() { return "float"; }
 };
 
 template <>
@@ -270,6 +303,9 @@ struct Result {
   double avg_time_ms = 0.0;
   double gflops = 0.0;
   bool passed = false;
+  char const *failure_stage = "none";
+  int failure_line = 0;
+  cudaError_t cuda_error = cudaSuccess;
 };
 
 struct GeneratedCandidateResult {
@@ -402,12 +438,32 @@ struct ArgumentFactory<
 template <typename Gemm, typename TensorSet>
 Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
   Result result;
+  auto fail_cuda = [&](char const *stage, int line, cudaError_t error) {
+    result.status = cutlass::Status::kErrorInternal;
+    result.failure_stage = stage;
+    result.failure_line = line;
+    result.cuda_error = error;
+  };
+  auto fail_cutlass = [&](char const *stage, int line) {
+    result.failure_stage = stage;
+    result.failure_line = line;
+  };
+
+  // Attribute a sticky asynchronous error to the preceding candidate instead
+  // of allowing it to surface later as an apparently unrelated Event failure.
+  cudaError_t cuda_error = cudaGetLastError();
+  if (cuda_error != cudaSuccess) {
+    fail_cuda("preexisting_cuda_error", __LINE__, cuda_error);
+    return result;
+  }
+
   Gemm gemm;
   typename Gemm::Arguments arguments =
       ArgumentFactory<Gemm>::make(options, tensors);
 
   result.status = Gemm::can_implement(arguments);
   if (result.status != cutlass::Status::kSuccess) {
+    fail_cutlass("can_implement", __LINE__);
     return result;
   }
 
@@ -415,29 +471,47 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
       Gemm::get_workspace_size(arguments));
   result.status = gemm.initialize(arguments, workspace.get());
   if (result.status != cutlass::Status::kSuccess) {
+    fail_cutlass("initialize", __LINE__);
     return result;
   }
 
   result.status = gemm();  // Warm-up.
-  if (result.status != cutlass::Status::kSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+  if (result.status != cutlass::Status::kSuccess) {
+    fail_cutlass("warmup_launch", __LINE__);
+    return result;
+  }
+  cuda_error = cudaPeekAtLastError();
+  if (cuda_error != cudaSuccess) {
+    fail_cuda("warmup_launch_cuda", __LINE__, cuda_error);
+    return result;
+  }
+  cuda_error = cudaDeviceSynchronize();
+  if (cuda_error != cudaSuccess) {
+    fail_cuda("warmup_sync", __LINE__, cuda_error);
     return result;
   }
 
   float elapsed_ms = 0.0f;
   if constexpr (kUseChronoTimer) {
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      result.status = cutlass::Status::kErrorInternal;
+    cuda_error = cudaDeviceSynchronize();
+    if (cuda_error != cudaSuccess) {
+      fail_cuda("chrono_pre_sync", __LINE__, cuda_error);
       return result;
     }
     auto const start_time = std::chrono::steady_clock::now();
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
       result.status = gemm();
       if (result.status != cutlass::Status::kSuccess) {
+        fail_cutlass("timed_launch", __LINE__);
         break;
       }
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-      result.status = cutlass::Status::kErrorInternal;
+    if (result.status != cutlass::Status::kSuccess) {
+      return result;
+    }
+    cuda_error = cudaDeviceSynchronize();
+    if (cuda_error != cudaSuccess) {
+      fail_cuda("chrono_post_sync", __LINE__, cuda_error);
       return result;
     }
     auto const stop_time = std::chrono::steady_clock::now();
@@ -446,30 +520,60 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
   } else {
     cudaEvent_t start_event = nullptr;
     cudaEvent_t stop_event = nullptr;
-    if (cudaEventCreate(&start_event) != cudaSuccess ||
-        cudaEventCreate(&stop_event) != cudaSuccess) {
-      if (start_event) cudaEventDestroy(start_event);
-      if (stop_event) cudaEventDestroy(stop_event);
-      result.status = cutlass::Status::kErrorInternal;
+    cuda_error = cudaEventCreate(&start_event);
+    if (cuda_error != cudaSuccess) {
+      fail_cuda("event_create_start", __LINE__, cuda_error);
+      return result;
+    }
+    cuda_error = cudaEventCreate(&stop_event);
+    if (cuda_error != cudaSuccess) {
+      cudaEventDestroy(start_event);
+      fail_cuda("event_create_stop", __LINE__, cuda_error);
       return result;
     }
 
-    cudaEventRecord(start_event);
+    cuda_error = cudaEventRecord(start_event);
+    if (cuda_error != cudaSuccess) {
+      cudaEventDestroy(start_event);
+      cudaEventDestroy(stop_event);
+      fail_cuda("event_record_start", __LINE__, cuda_error);
+      return result;
+    }
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
       result.status = gemm();
       if (result.status != cutlass::Status::kSuccess) {
+        fail_cutlass("timed_launch", __LINE__);
         break;
       }
     }
-    cudaEventRecord(stop_event);
-    cudaEventSynchronize(stop_event);
-    cudaEventElapsedTime(&elapsed_ms, start_event, stop_event);
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(stop_event);
-  }
-
-  if (result.status != cutlass::Status::kSuccess) {
-    return result;
+    if (result.status == cutlass::Status::kSuccess) {
+      cuda_error = cudaEventRecord(stop_event);
+      if (cuda_error != cudaSuccess) {
+        fail_cuda("event_record_stop", __LINE__, cuda_error);
+      } else {
+        cuda_error = cudaEventSynchronize(stop_event);
+        if (cuda_error != cudaSuccess) {
+          fail_cuda("event_sync_stop", __LINE__, cuda_error);
+        } else {
+          cuda_error = cudaEventElapsedTime(&elapsed_ms, start_event, stop_event);
+          if (cuda_error != cudaSuccess) {
+            fail_cuda("event_elapsed_time", __LINE__, cuda_error);
+          }
+        }
+      }
+    }
+    cudaError_t destroy_start_error = cudaEventDestroy(start_event);
+    cudaError_t destroy_stop_error = cudaEventDestroy(stop_event);
+    if (result.status == cutlass::Status::kSuccess &&
+        destroy_start_error != cudaSuccess) {
+      fail_cuda("event_destroy_start", __LINE__, destroy_start_error);
+    } else if (result.status == cutlass::Status::kSuccess &&
+               destroy_stop_error != cudaSuccess) {
+      fail_cuda("event_destroy_stop", __LINE__, destroy_stop_error);
+    }
+    if (result.status != cutlass::Status::kSuccess) {
+      return result;
+    }
   }
 
   result.avg_time_ms = double(elapsed_ms) / options.iterations;
@@ -478,8 +582,17 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
 
   if constexpr (kVerifyResults) {
     tensors.d.sync_host();
+    cuda_error = cudaGetLastError();
+    if (cuda_error != cudaSuccess) {
+      fail_cuda("verification_copy", __LINE__, cuda_error);
+      return result;
+    }
     result.passed = cutlass::reference::host::TensorEquals(
         tensors.d.host_view(), tensors.reference.host_view());
+    if (!result.passed) {
+      result.failure_stage = "verification_compare";
+      result.failure_line = __LINE__;
+    }
   } else {
     result.passed = true;
   }
@@ -550,6 +663,12 @@ void print_result(char const *configuration_name, Result const &result) {
                        : (result.passed ? "Passed" : "Failed verification"))
                     : cutlassGetStatusString(result.status))
             << "\n"
+            << "  failure_stage: " << result.failure_stage << "\n"
+            << "  failure_location: examples/gemm/gemm.cu:"
+            << result.failure_line << "\n"
+            << "  cuda_error: " << static_cast<int>(result.cuda_error)
+            << " (" << cudaGetErrorName(result.cuda_error) << ": "
+            << cudaGetErrorString(result.cuda_error) << ")\n"
             << "  avg_time: " << result.avg_time_ms << " ms\n"
             << "  gflops: " << result.gflops << "\n";
 }
@@ -562,6 +681,7 @@ void print_cutlass_record(char const *record_type, char const *source,
             << record_type
             << " m=" << options.m << " n=" << options.n << " k=" << options.k
             << " source=" << source << " name=" << configuration_name
+            << " accumulator=" << ConfigName<ElementAccumulator>::value()
             << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
             << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
             << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
@@ -578,6 +698,10 @@ void print_cutlass_record(char const *record_type, char const *source,
             << " stages=" << Gemm::kStages
             << " split_k=" << options.split_k_slices
             << " valid=" << ((result.status == cutlass::Status::kSuccess && result.passed) ? 1 : 0)
+            << " failure_stage=" << result.failure_stage
+            << " failure_line=" << result.failure_line
+            << " cuda_error=" << static_cast<int>(result.cuda_error)
+            << " cuda_error_name=" << cudaGetErrorName(result.cuda_error)
             << " avg_time_ms=" << result.avg_time_ms
             << " gflops=" << result.gflops << "\n";
 }
@@ -589,6 +713,7 @@ void print_generated_record(char const *record_type, Options const &options,
             << record_type
             << " m=" << options.m << " n=" << options.n << " k=" << options.k
             << " source=cublaslt-derived name=" << g.name
+            << " accumulator=" << ConfigName<ElementAccumulator>::value()
             << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
             << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
             << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
@@ -601,6 +726,10 @@ void print_generated_record(char const *record_type, Options const &options,
             << " swizzle=Identity stages=" << g.stages
             << " split_k=" << g.split_k_slices
             << " valid=" << ((result.status == cutlass::Status::kSuccess && result.passed) ? 1 : 0)
+            << " failure_stage=" << result.failure_stage
+            << " failure_line=" << result.failure_line
+            << " cuda_error=" << static_cast<int>(result.cuda_error)
+            << " cuda_error_name=" << cudaGetErrorName(result.cuda_error)
             << " avg_time_ms=" << result.avg_time_ms
             << " gflops=" << result.gflops << "\n";
 }
@@ -617,7 +746,7 @@ void print_generated_configuration(Options const &options) {
             << "  A: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
             << "  B: half, column-major\n"
             << "  C: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
-            << "  accumulator: half\n"
+            << "  accumulator: " << ConfigName<ElementAccumulator>::value() << "\n"
             << "  operator class / arch: OpClassTensorOp / Sm80\n"
             << "  threadblock: " << g.threadblock_m << "x" << g.threadblock_n << "x" << g.threadblock_k << "\n"
             << "  warp: " << g.warp_m << "x" << g.warp_n << "x" << g.warp_k << "\n"
@@ -637,12 +766,16 @@ int profile_all_candidates(Options const &options) {
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
   using AttentionPV = AttentionPVStreamKGemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
+  using Fp32Compact = Fp32CompactGemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC>;
 
   std::string const linear_name = make_configuration_name<Linear>("Linear");
   std::string const attention_qk_name =
       make_configuration_name<AttentionQK>("Attention-QK");
   std::string const attention_pv_name =
       make_configuration_name<AttentionPV>("Attention-PV-StreamK");
+  std::string const fp32_compact_name =
+      make_configuration_name<Fp32Compact>("FP32-Compact");
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
@@ -664,6 +797,18 @@ int profile_all_candidates(Options const &options) {
   Result attention_pv = run_tensorop_gemm<AttentionPV>(options, tensors);
   print_cutlass_record<AttentionPV>("CUTLASS_CANDIDATE", "baseline", attention_pv_name.c_str(), options, attention_pv);
   if (!kConciseLog) print_result(attention_pv_name.c_str(), attention_pv);
+
+  Result fp32_compact;
+  if constexpr (std::is_same<ElementAccumulator, float>::value) {
+    if (!kConciseLog) {
+      print_configuration<Fp32Compact>(fp32_compact_name.c_str(), options);
+    }
+    fp32_compact = run_tensorop_gemm<Fp32Compact>(options, tensors);
+    print_cutlass_record<Fp32Compact>(
+        "CUTLASS_CANDIDATE", "fp32-baseline",
+        fp32_compact_name.c_str(), options, fp32_compact);
+    if (!kConciseLog) print_result(fp32_compact_name.c_str(), fp32_compact);
+  }
 
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
@@ -694,6 +839,15 @@ int profile_all_candidates(Options const &options) {
     best_result = &attention_pv;
     best_is_generated = false;
   }
+  if constexpr (std::is_same<ElementAccumulator, float>::value) {
+    if (fp32_compact.status == cutlass::Status::kSuccess &&
+        fp32_compact.passed &&
+        (!best_result || fp32_compact.avg_time_ms < best_result->avg_time_ms)) {
+      best_configuration_name = fp32_compact_name.c_str();
+      best_result = &fp32_compact;
+      best_is_generated = false;
+    }
+  }
 
   if (!best_result) {
     std::cerr << "\nNo candidate completed successfully and passed verification.\n";
@@ -710,8 +864,11 @@ int profile_all_candidates(Options const &options) {
     } else if (best_result == &attention_qk) {
       print_configuration<AttentionQK>(best_configuration_name, options);
       print_result(best_configuration_name, *best_result);
-    } else {
+    } else if (best_result == &attention_pv) {
       print_configuration<AttentionPV>(best_configuration_name, options);
+      print_result(best_configuration_name, *best_result);
+    } else {
+      print_configuration<Fp32Compact>(best_configuration_name, options);
       print_result(best_configuration_name, *best_result);
     }
   }
@@ -725,8 +882,10 @@ int profile_all_candidates(Options const &options) {
     print_cutlass_record<Linear>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
   } else if (best_result == &attention_qk) {
     print_cutlass_record<AttentionQK>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
-  } else {
+  } else if (best_result == &attention_pv) {
     print_cutlass_record<AttentionPV>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else {
+    print_cutlass_record<Fp32Compact>("CUTLASS_BEST", "fp32-baseline", best_configuration_name, options, *best_result);
   }
   return EXIT_SUCCESS;
 }
@@ -747,6 +906,8 @@ int profile_large_m_candidates(Options const &options) {
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
   using Tile64x256 = LargeM64x256Gemm<
       LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
+  using Fp32Tile64x64 = Fp32LargeM64x64Gemm<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC, kStages>;
 
   std::string const tile_128x128_name =
       make_configuration_name<Tile128x128>("Large-M");
@@ -760,6 +921,8 @@ int profile_large_m_candidates(Options const &options) {
       make_configuration_name<Tile128x64>("Large-M");
   std::string const tile_64x256_name =
       make_configuration_name<Tile64x256>("Large-M");
+  std::string const fp32_tile_64x64_name =
+      make_configuration_name<Fp32Tile64x64>("FP32-Large-M");
 
   TensorSet tensors;
   if (!initialize_tensors(options, tensors) ||
@@ -797,6 +960,22 @@ int profile_large_m_candidates(Options const &options) {
   print_cutlass_record<Tile64x256>("CUTLASS_CANDIDATE", "baseline", tile_64x256_name.c_str(), options, tile_64x256);
   if (!kConciseLog) print_result(tile_64x256_name.c_str(), tile_64x256);
 
+  Result fp32_tile_64x64;
+  if constexpr (std::is_same<ElementAccumulator, float>::value) {
+    if (!kConciseLog) {
+      print_configuration<Fp32Tile64x64>(
+          fp32_tile_64x64_name.c_str(), options);
+    }
+    fp32_tile_64x64 =
+        run_tensorop_gemm<Fp32Tile64x64>(options, tensors);
+    print_cutlass_record<Fp32Tile64x64>(
+        "CUTLASS_CANDIDATE", "fp32-baseline",
+        fp32_tile_64x64_name.c_str(), options, fp32_tile_64x64);
+    if (!kConciseLog) {
+      print_result(fp32_tile_64x64_name.c_str(), fp32_tile_64x64);
+    }
+  }
+
   char const *best_configuration_name = nullptr;
   Result const *best_result = nullptr;
   bool best_is_generated = false;
@@ -821,6 +1000,9 @@ int profile_large_m_candidates(Options const &options) {
   consider(tile_64x128_name.c_str(), tile_64x128);
   consider(tile_128x64_name.c_str(), tile_128x64);
   consider(tile_64x256_name.c_str(), tile_64x256);
+  if constexpr (std::is_same<ElementAccumulator, float>::value) {
+    consider(fp32_tile_64x64_name.c_str(), fp32_tile_64x64);
+  }
 
   if (!best_result) {
     std::cerr << "\nNo large-M candidate completed successfully and passed verification.\n";
@@ -840,8 +1022,10 @@ int profile_large_m_candidates(Options const &options) {
       print_configuration<Tile64x128>(best_configuration_name, options);
     } else if (best_result == &tile_128x64) {
       print_configuration<Tile128x64>(best_configuration_name, options);
-    } else {
+    } else if (best_result == &tile_64x256) {
       print_configuration<Tile64x256>(best_configuration_name, options);
+    } else {
+      print_configuration<Fp32Tile64x64>(best_configuration_name, options);
     }
     print_result(best_configuration_name, *best_result);
   }
@@ -861,8 +1045,10 @@ int profile_large_m_candidates(Options const &options) {
     print_cutlass_record<Tile64x128>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
   } else if (best_result == &tile_128x64) {
     print_cutlass_record<Tile128x64>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
-  } else {
+  } else if (best_result == &tile_64x256) {
     print_cutlass_record<Tile64x256>("CUTLASS_BEST", "baseline", best_configuration_name, options, *best_result);
+  } else {
+    print_cutlass_record<Fp32Tile64x64>("CUTLASS_BEST", "fp32-baseline", best_configuration_name, options, *best_result);
   }
   return EXIT_SUCCESS;
 }
@@ -900,26 +1086,31 @@ int profile_optimal_template(char const *family, Options const &options,
 }
 
 int profile_optimal_only_candidate(Options const &options) {
-#define GEMM_OPTIMAL_ENTRY(M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C,              \
+#define GEMM_OPTIMAL_ENTRY(ACCUMULATOR, M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C, \
                            ALIGN_A, ALIGN_B, ALIGN_C,                           \
                            TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE, STAGES)   \
-  if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+  if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {         \
+   if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
     return profile_optimal_template<                                            \
         LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
         cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
         cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(              \
             "Optimal", options);                                               \
+   }                                                                            \
   }
-#define GEMM_OPTIMAL_ENTRY_EX(M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C,           \
+#define GEMM_OPTIMAL_ENTRY_EX(ACCUMULATOR, M, N, K, LAYOUT_A, LAYOUT_B,        \
+                              LAYOUT_C,                                         \
                               ALIGN_A, ALIGN_B, ALIGN_C,                        \
                               TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE,        \
                               STAGES, SPLIT_K)                                  \
-  if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+  if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {         \
+   if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
     return profile_optimal_template<                                            \
         LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
         cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
         cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(              \
             "Optimal", options, SPLIT_K);                                      \
+   }                                                                            \
   }
 #if __has_include("optimal_configurations.inc")
 #include "optimal_configurations.inc"
