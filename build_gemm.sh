@@ -6,8 +6,9 @@ arch="sm_89"
 nvcc_command="${NVCC:-nvcc}"
 concise_log=0
 timer="cuda-event"
-accumulator="fp16"
+accumulator="fp32"
 optimal_only=0
+ncu_exact=0
 skip_verification=0
 
 usage() {
@@ -22,8 +23,9 @@ Options:
   --nvcc PATH       nvcc executable (default: $NVCC or nvcc)
   --concise-log     Compile gemm to print only the winning candidate details
   --timer TIMER     cuda-event or chrono (default: cuda-event)
-  --accumulator TYPE  fp16 or fp32 accumulation (default: fp16)
+  --accumulator TYPE  fp16 or fp32 accumulation (default: fp32)
   --optimal-only    Run one preselected template for mapped exact M/N/K shapes
+  --ncu-exact       Use only exact NCU CTA M/N/K and stages mappings; no fallback
   --skip-verification  Skip reference GEMM, result copies, and comparison
   --help            Show this help
 EOF
@@ -59,6 +61,10 @@ while (($# > 0)); do
       optimal_only=1
       shift
       ;;
+    --ncu-exact)
+      ncu_exact=1
+      shift
+      ;;
     --skip-verification)
       skip_verification=1
       shift
@@ -85,6 +91,11 @@ done
   exit 2
 }
 
+if ((optimal_only == 1 && ncu_exact == 1)); then
+  echo "--optimal-only and --ncu-exact are mutually exclusive." >&2
+  exit 2
+fi
+
 cutlass_root="$(pwd)"
 source_file="$cutlass_root/examples/gemm/gemm.cu"
 output_file="$cutlass_root/examples/gemm/gemm"
@@ -110,10 +121,14 @@ echo "Output: $output_file"
 extra_nvcc_flags=()
 if [[ "$accumulator" == "fp32" ]]; then
   extra_nvcc_flags+=("-DGEMM_ACCUMULATOR_TYPE=float")
+else
+  extra_nvcc_flags+=("-DGEMM_ACCUMULATOR_TYPE=cutlass::half_t")
 fi
 cublaslt_nvcc_flags=()
 if [[ "$accumulator" == "fp32" ]]; then
   cublaslt_nvcc_flags+=("-DGEMM_CUBLASLT_FP32_ACCUMULATOR=1")
+else
+  cublaslt_nvcc_flags+=("-DGEMM_CUBLASLT_FP32_ACCUMULATOR=0")
 fi
 if [[ "$timer" == "chrono" ]]; then
   extra_nvcc_flags+=("-DGEMM_USE_CHRONO=1")
@@ -124,6 +139,17 @@ if ((optimal_only == 1)); then
   echo "Optimal source: examples/gemm/optimal_configurations.inc"
 else
   echo "Candidate mode: compare all applicable candidates"
+fi
+if ((ncu_exact == 1)); then
+  ncu_exact_file="$cutlass_root/examples/gemm/ncu_exact_configurations.inc"
+  if [[ ! -f "$ncu_exact_file" ]]; then
+    echo "NCU-exact configuration not found: $ncu_exact_file" >&2
+    echo "Generate it with tools/qwen_gemm/generate_ncu_exact_configurations.py." >&2
+    exit 2
+  fi
+  extra_nvcc_flags+=("-DGEMM_NCU_EXACT_ONLY=1")
+  echo "Candidate mode: NCU-exact only (strict match, no fallback)"
+  echo "NCU exact source: examples/gemm/ncu_exact_configurations.inc"
 fi
 if ((skip_verification == 1)); then
   extra_nvcc_flags+=("-DGEMM_SKIP_VERIFICATION=1")

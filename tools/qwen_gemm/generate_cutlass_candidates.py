@@ -63,32 +63,32 @@ def stage_spec(stage_id: int) -> tuple[int, int, str]:
     return 32, 3, "fallback-stage"
 
 
-def alignment(m: int, k: int) -> tuple[int, int, int, bool]:
-    if m == 1:
-        return 8, 8, 8, True
-
+def alignment(m: int, n: int, k: int, trans: str) -> tuple[int, int, int, bool]:
     def maximum_alignment(extent: int) -> int:
         for candidate in (8, 4, 2):
             if extent % candidate == 0:
                 return candidate
         return 1
 
-    # ColumnMajor A/C are contiguous in M; ColumnMajor B is contiguous in K.
-    alignment_a = maximum_alignment(m)
-    alignment_b = maximum_alignment(k)
-    alignment_c = alignment_a
+    contiguous_a = m if trans[0] == "N" else k
+    contiguous_b = k if trans[1] == "N" else n
+    alignment_a = maximum_alignment(contiguous_a)
+    alignment_b = maximum_alignment(contiguous_b)
+    alignment_c = maximum_alignment(m)
     return alignment_a, alignment_b, alignment_c, (
         alignment_a >= 2 and alignment_b >= 2
     )
 
 
-def parse_log(path: Path) -> dict[tuple[int,int,int], dict[str,str]]:
+def parse_log(path: Path) -> dict[tuple[int,int,int,str,int], dict[str,str]]:
     records = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         match = BEST.search(line)
         if not match: continue
         fields = dict(FIELD.findall(match.group(1)))
-        shape = tuple(int(fields[x]) for x in ("m", "n", "k"))
+        shape = (*tuple(int(fields[x]) for x in ("m", "n", "k")),
+                 fields.get("trans", "NN"),
+                 int(fields.get("batch_count", "1")))
         records[shape] = fields
     if not records:
         raise ValueError(f"No CUBLASLT_BEST records found in {path}")
@@ -118,7 +118,7 @@ def main() -> int:
             f"{sorted(actual_accumulators)}"
         )
     rows, cases = [], []
-    for (m,n,k), fields in sorted(records.items()):
+    for (m,n,k,trans,batch_count), fields in sorted(records.items()):
         source = TILES.get(int(fields["tile_id"]))
         if source is None:
             source = (128,256) if n >= 2*m else ((256,128) if m >= 2*n else (128,128))
@@ -128,35 +128,43 @@ def main() -> int:
         tbm,tbn = source if source in CATALOG else nearest_tile(source)
         wm,wn = CATALOG[(tbm,tbn)]
         tbk,stages,stage_reason = stage_spec(int(fields["stages_id"]))
-        aa,ab,ac,async_ok = alignment(m,k)
+        aa,ab,ac,async_ok = alignment(m,n,k,trans)
         if not async_ok:
             tbk,stages,stage_reason = 32,2,"alignment1-sync-override"
         wk = min(32,tbk)
-        split_k = max(1, int(fields.get("split_k", "0")))
-        layout = ("LayoutAM1, LayoutBM1, LayoutCM1" if m == 1 else
-                  "LayoutAAttention, LayoutBAttention, LayoutCAttention")
+        split_k = 1 if batch_count > 1 else max(
+            1, int(fields.get("split_k", "0")))
+        layout_a = ("cutlass::layout::RowMajor" if trans[0] == "T"
+                    else "cutlass::layout::ColumnMajor")
+        layout_b = ("cutlass::layout::RowMajor" if trans[1] == "T"
+                    else "cutlass::layout::ColumnMajor")
+        layout = f"{layout_a}, {layout_b}, cutlass::layout::ColumnMajor"
         name = (
             f"cuBLASLt-derived TB{tbm}x{tbn}x{tbk}_"
             f"W{wm}x{wn}x{wk}_S{stages}"
         )
         cases.append(
-            f"  // Raw cuBLASLt reference: algo_id={fields['algo_id']}, "
+            f"  // [direct:cublasLt-api] algo_id={fields['algo_id']}, "
             f"tile_id={fields['tile_id']} ({source[0]}x{source[1]}), "
             f"stages_id={fields['stages_id']}, split_k={fields.get('split_k', '0')}, "
             f"reduction={fields.get('reduction', '0')}, swizzle={fields.get('swizzle', '0')}, "
             f"workspace={fields.get('workspace', '0')}.\n"
-            f"  // CUTLASS mapping: threadblock={tbm}x{tbn}x{tbk}, "
+            f"  // [derived:cutlass-candidate] threadblock={tbm}x{tbn}x{tbk}, "
             f"warp={wm}x{wn}x{wk}, stages={stages}, alignment={aa}/{ab}/{ac}, "
             f"split_k={split_k}, tile_mapping={reason}, stage_mapping={stage_reason}.\n"
             f"  if constexpr (std::is_same<ElementAccumulator, "
             f"{'cutlass::half_t' if args.accumulator == 'fp16' else 'float'}>::value) {{\n"
-            f"   if (options.m == {m} && options.n == {n} && options.k == {k}) {{\n"
+            f"   if (options.m == {m} && options.n == {n} && options.k == {k} && "
+            f"options.trans == \"{trans}\" && options.batch_count == {batch_count}) {{\n"
             f"    return profile_cublaslt_template<{layout}, {aa}, {ab}, {ac},\n"
             f"        cutlass::gemm::GemmShape<{tbm}, {tbn}, {tbk}>,\n"
             f"        cutlass::gemm::GemmShape<{wm}, {wn}, {wk}>, {stages}>(\"{name}\", {split_k}, options);\n"
             f"   }}\n"
             f"  }}")
-        rows.append({"m":m,"n":n,"k":k,"accumulator":args.accumulator,
+        rows.append({"m":m,"n":n,"k":k,"trans":trans,
+            "batch_count":batch_count,"accumulator":args.accumulator,
+            "cublaslt_config_origin":"direct:cublaslt-api",
+            "cublaslt_measurement_origin":"direct:cuda-event",
             "algo_id":fields["algo_id"],
             "cublaslt_avg_time_ms":fields.get("avg_time_ms", ""),
             "cublaslt_gflops":fields.get("gflops", ""),
@@ -164,7 +172,13 @@ def main() -> int:
             "cublaslt_stages_id":fields["stages_id"],"cutlass_threadblock":f"{tbm}x{tbn}x{tbk}",
             "cutlass_warp":f"{wm}x{wn}x{wk}","cutlass_stages":stages,
             "cutlass_split_k":split_k,"alignment":f"{aa}/{ab}/{ac}",
-            "tile_mapping":reason,"stage_mapping":stage_reason})
+            "tile_mapping":reason,"stage_mapping":stage_reason,
+            "cutlass_threadblock_origin":f"derived:{reason};tb_k=fixed-32",
+            "cutlass_warp_origin":"derived:legal-cutlass-catalog",
+            "cutlass_stages_origin":f"derived:{stage_reason}",
+            "cutlass_split_k_origin":"copied:direct-cublaslt-split-k",
+            "alignment_origin":"derived:mnk-contiguous-extents",
+            "layout_origin":"derived:gemm-storage-policy"})
     content = (
         "// Generated by generate_cutlass_candidates.py; do not edit.\n"
         f"// Accumulator: {args.accumulator}\n"

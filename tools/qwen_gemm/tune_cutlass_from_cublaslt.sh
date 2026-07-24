@@ -2,24 +2,25 @@
 set -euo pipefail
 
 bash_command="${BASH:-bash}"
+tool_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 model="7b"
 iterations=20
 arch="sm_89"
 log_dir=""
-accumulator="fp16"
+accumulator="fp32"
 
 usage() {
   cat <<'EOF'
 Profile Decode and Prefill with cuBLASLt, generate exact-shape CUTLASS
 templates, and rebuild GEMM with the narrowed configuration set.
 
-Usage: ./tune_cutlass_from_cublaslt.sh [options]
+Usage: ./tools/qwen_gemm/tune_cutlass_from_cublaslt.sh [options]
   --model MODEL       Qwen2.5 model size (default: 7b)
   --iterations N      Timed iterations per cuBLASLt candidate (default: 20)
   --arch ARCH         CUDA architecture passed to build_gemm.sh (default: sm_89)
-  --accumulator TYPE  fp16 or fp32 profiling (default: fp16)
-  --log-dir DIR       Tuning artifacts directory (default: cublaslt_tuning/TYPE)
+  --accumulator TYPE  fp16 or fp32 profiling (default: fp32)
+  --log-dir DIR       Artifacts directory (default: outputs/qwen_gemm/cublaslt_tuning/TYPE)
   --help              Show this help
 EOF
 }
@@ -39,7 +40,7 @@ done
   echo "Unsupported accumulator: $accumulator (expected fp16 or fp32)" >&2
   exit 2
 }
-[[ -n "$log_dir" ]] || log_dir="cublaslt_tuning/$accumulator"
+[[ -n "$log_dir" ]] || log_dir="outputs/qwen_gemm/cublaslt_tuning/$accumulator"
 
 mkdir -p "$log_dir"
 
@@ -65,7 +66,7 @@ fi
 "$bash_command" ./run_gemm.sh --backend cublaslt --model "$model" --stage prefill \
   --iterations "$iterations" | tee "$log_dir/cublaslt_prefill.log"
 
-python3 generate_cutlass_candidates.py \
+python3 "$tool_dir/generate_cutlass_candidates.py" \
   --log "$log_dir/cublaslt_decode.log" \
   --log "$log_dir/cublaslt_prefill.log" \
   --output "$generated_tmp" \

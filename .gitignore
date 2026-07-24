@@ -4,3 +4,13 @@ cutlass_library.egg-info/
 /build*
 /optimal_tuning/
 /examples/gemm/cublaslt_generated_candidates.inc
+/examples/gemm/ncu_exact_configurations.inc
+/outputs/qwen_gemm/
+/examples/gemm/gemm
+/examples/gemm/cublaslt_profiler
+/examples/gemm/*.exe
+**/__pycache__/
+*.pyc
+*.new
+*.failed
+*.previous

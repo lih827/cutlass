@@ -168,17 +168,16 @@ shape_for_decode_op() {
   local operation="$1"
   local context_length="$2"
   local token_m="$batch"
-  local attention_m=$((batch * heads))
 
   case "$operation" in
-    "Q")              m=$token_m;     n=$h;                     k=$h ;;
-    "K"|"V")         m=$token_m;     n=$((kv_heads * head_dim)); k=$h ;;
-    "Attention QK^T") m=$attention_m; n=$context_length;        k=$head_dim ;;
-    "Attention PV")   m=$attention_m; n=$head_dim;              k=$context_length ;;
-    "Attention Out")  m=$token_m;     n=$h;                     k=$h ;;
-    "MLP Up"|"MLP Gate") m=$token_m; n=$intermediate; k=$h ;;
-    "MLP Down")       m=$token_m;     n=$h;                     k=$intermediate ;;
-    "LM Head")        m=$token_m;     n=$vocab;                 k=$h ;;
+    "Q")              m=$h;                     n=$token_m;     k=$h ;;
+    "K"|"V")         m=$((kv_heads * head_dim)); n=$token_m;    k=$h ;;
+    "Attention QK^T") m=$context_length;        n=1; k=$head_dim ;;
+    "Attention PV")   m=$head_dim;              n=1; k=$context_length ;;
+    "Attention Out")  m=$h;                     n=$token_m;     k=$h ;;
+    "MLP Up"|"MLP Gate") m=$intermediate; n=$token_m; k=$h ;;
+    "MLP Down")       m=$h;              n=$token_m; k=$intermediate ;;
+    "LM Head")        m=$vocab;          n=$token_m; k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
   esac
 }
@@ -187,35 +186,63 @@ shape_for_prefill_op() {
   local operation="$1"
   local sequence_length="$2"
   local token_m=$((batch * sequence_length))
-  local attention_m=$((batch * heads * sequence_length))
 
   case "$operation" in
-    "Q")              m=$token_m;     n=$h;                      k=$h ;;
-    "K"|"V")         m=$token_m;     n=$((kv_heads * head_dim)); k=$h ;;
-    "Attention QK^T") m=$attention_m; n=$sequence_length;        k=$head_dim ;;
-    "Attention PV")   m=$attention_m; n=$head_dim;               k=$sequence_length ;;
-    "Attention Out")  m=$token_m;     n=$h;                      k=$h ;;
-    "MLP Up"|"MLP Gate") m=$token_m; n=$intermediate; k=$h ;;
-    "MLP Down")       m=$token_m;     n=$h;                      k=$intermediate ;;
+    "Q")              m=$h;                     n=$token_m;     k=$h ;;
+    "K"|"V")         m=$((kv_heads * head_dim)); n=$token_m;    k=$h ;;
+    "Attention QK^T") m=$sequence_length;       n=$sequence_length; k=$head_dim ;;
+    "Attention PV")   m=$head_dim;              n=$sequence_length; k=$sequence_length ;;
+    "Attention Out")  m=$h;                     n=$token_m;     k=$h ;;
+    "MLP Up"|"MLP Gate") m=$intermediate; n=$token_m; k=$h ;;
+    "MLP Down")       m=$h;              n=$token_m; k=$intermediate ;;
     # Prefill only materializes logits for the final prompt position.
-    "LM Head")        m=$batch;       n=$vocab;                  k=$h ;;
+    "LM Head")        m=$vocab;       n=$batch;                  k=$h ;;
     *) echo "Unsupported operation: $operation" >&2; return 2 ;;
   esac
 }
 
 declare -A shape_to_slot=()
 declare -a case_m=() case_n=() case_k=() case_operations=() case_lengths=()
+declare -a case_trans=() case_operand_a=() case_operand_b=()
+declare -a case_batch_count=()
+
+set_cublas_semantics() {
+  case "$1" in
+    "Q")              trans="TN"; operand_a="W_Q";    operand_b="HiddenStates" ;;
+    "K")              trans="TN"; operand_a="W_K";    operand_b="HiddenStates" ;;
+    "V")              trans="TN"; operand_a="W_V";    operand_b="HiddenStates" ;;
+    "Attention Out")  trans="TN"; operand_a="W_O";    operand_b="AttentionOutput" ;;
+    "MLP Up")         trans="TN"; operand_a="W_up";   operand_b="MLPInput" ;;
+    "MLP Gate")       trans="TN"; operand_a="W_gate"; operand_b="MLPInput" ;;
+    "MLP Down")       trans="TN"; operand_a="W_down"; operand_b="SwiGLUOutput" ;;
+    "LM Head"|"LM Head (last token only)") trans="TN"; operand_a="W_lm_head"; operand_b="LastHiddenState" ;;
+    "Attention QK^T") trans="TN"; operand_a="K";      operand_b="Q" ;;
+    "Attention PV")   trans="NN"; operand_a="V";      operand_b="P" ;;
+    *) echo "Unsupported operation semantics: $1" >&2; return 2 ;;
+  esac
+}
 
 add_unique_case() {
   local operation="$1"
   local context_length="$2"
-  local key="${m}x${n}x${k}"
+  set_cublas_semantics "$operation"
+  local gemm_batch_count=1
+  if [[ "$operation" == "Attention QK^T" || "$operation" == "Attention PV" ]]; then
+    gemm_batch_count=$((batch * heads))
+  fi
+  local key="${m}x${n}x${k}x${trans}x${gemm_batch_count}"
   local slot
 
   if [[ -n "${shape_to_slot[$key]+present}" ]]; then
     slot="${shape_to_slot[$key]}"
     if [[ " / ${case_operations[$slot]} / " != *" / $operation / "* ]]; then
       case_operations[$slot]+=" / $operation"
+    fi
+    if [[ " / ${case_operand_a[$slot]} / " != *" / $operand_a / "* ]]; then
+      case_operand_a[$slot]+=" / $operand_a"
+    fi
+    if [[ " / ${case_operand_b[$slot]} / " != *" / $operand_b / "* ]]; then
+      case_operand_b[$slot]+=" / $operand_b"
     fi
     if [[ ",${case_lengths[$slot]}," != *",$context_length,"* ]]; then
       case_lengths[$slot]+=",$context_length"
@@ -230,6 +257,10 @@ add_unique_case() {
   case_k[$slot]=$k
   case_operations[$slot]="$operation"
   case_lengths[$slot]="$context_length"
+  case_trans[$slot]="$trans"
+  case_operand_a[$slot]="$operand_a"
+  case_operand_b[$slot]="$operand_b"
+  case_batch_count[$slot]="$gemm_batch_count"
 }
 
 if [[ "$stage" == "decode" ]]; then
@@ -279,13 +310,26 @@ for slot in "${!case_m[@]}"; do
     k=${case_k[$slot]}
     operations_label=${case_operations[$slot]}
     lengths_label=${case_lengths[$slot]}
-    command=("$executable" "--m=$m" "--n=$n" "--k=$k" "--iterations=$iterations")
+    trans=${case_trans[$slot]}
+    operand_a=${case_operand_a[$slot]}
+    operand_b=${case_operand_b[$slot]}
+    batch_count=${case_batch_count[$slot]}
+    operation_key=${operations_label// /_}
+    operation_key=${operation_key//\//+}
+    operand_a_key=${operand_a// /_}
+    operand_a_key=${operand_a_key//\//+}
+    operand_b_key=${operand_b// /_}
+    operand_b_key=${operand_b_key//\//+}
+    command=("$executable" "--m=$m" "--n=$n" "--k=$k"
+             "--batch-count=$batch_count" "--iterations=$iterations")
     if [[ "$backend" == "cutlass" ]]; then
-      command+=("--alpha=$alpha" "--beta=$beta")
+      command+=("--alpha=$alpha" "--beta=$beta" "--operation=$operation_key"
+                "--operand-a=$operand_a_key" "--operand-b=$operand_b_key" "--trans=$trans")
     fi
 
-    printf '\n[%d/%d] stage=%s length=%s ops=%s MxNxK=%dx%dx%d\n' \
-      "$case_index" "$total_cases" "${stage^}" "$lengths_label" "$operations_label" "$m" "$n" "$k"
+    printf '\n[%d/%d] stage=%s length=%s ops=%s A=%s B=%s trans=%s batchCount=%d MxNxK=%dx%dx%d\n' \
+      "$case_index" "$total_cases" "${stage^}" "$lengths_label" "$operations_label" \
+      "$operand_a" "$operand_b" "$trans" "$batch_count" "$m" "$n" "$k"
     printf 'Command:'
     printf ' %q' "${command[@]}"
     printf '\n'

@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1040" viewBox="0 0 1800 1040">
+  <defs>
+    <style>
+      .bg { fill: #f7f7f4; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #1f2933; }
+      .subtitle { font: 16px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #52606d; }
+      .laneTitle { font: 700 24px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #17202a; }
+      .groupTitle { font: 700 14px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #334e68; }
+      .label { font: 16px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #202a35; }
+      .small { font: 13px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #425466; }
+      .tiny { font: 12px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #52606d; }
+      .box { stroke: #2f3a4a; stroke-width: 1.4; rx: 8; ry: 8; }
+      .soft { stroke: #7b8794; stroke-width: 1.1; rx: 8; ry: 8; }
+      .group { fill: none; stroke: #8fa1b3; stroke-width: 1.5; stroke-dasharray: 6 5; rx: 12; ry: 12; }
+      .prefill { fill: #e4f2ff; }
+      .decode { fill: #e9f7ef; }
+      .layer { fill: #fff8e6; }
+      .cache { fill: #f1e7ff; }
+      .out { fill: #ffe8df; }
+      .op { fill: #ffffff; }
+      .arrow { stroke: #34495e; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .cacheArrow { stroke: #7d3c98; stroke-width: 2.2; fill: none; marker-end: url(#arrowPurple); stroke-dasharray: 7 5; }
+      .stageLine { stroke: #d0d7de; stroke-width: 1.2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#34495e" />
+    </marker>
+    <marker id="arrowPurple" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#7d3c98" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1040" />
+
+  <text class="title" x="60" y="58">Qwen2.5-0.5B 生成一个 token 时的 Prefill 与 Decode 流程</text>
+  <text class="subtitle" x="60" y="88">decoder-only Transformer，24 层，hidden=896，Q heads=14，KV heads=2，head_dim=64，MLP intermediate=4864</text>
+
+  <rect class="soft prefill" x="55" y="125" width="650" height="860" />
+  <rect class="soft decode" x="1095" y="125" width="650" height="860" />
+  <line class="stageLine" x1="900" y1="120" x2="900" y2="955" />
+
+  <text class="laneTitle" x="85" y="165">Prefill 阶段：处理整段 prompt，建立 KV Cache</text>
+  <text class="laneTitle" x="1125" y="165">Decode 阶段：输入 1 个 token，产出下一个 token</text>
+
+  <!-- Prefill input group -->
+  <rect class="group" x="82" y="190" width="596" height="210" />
+  <text class="groupTitle" x="105" y="213">输入与嵌入</text>
+  <rect class="box prefill" x="105" y="230" width="540" height="62" />
+  <text class="label" x="130" y="257">Prompt token ids</text>
+  <text class="small" x="130" y="279">形状：[B, S]，例如 x1...xS</text>
+
+  <path class="arrow" d="M375 292 V327" />
+  <rect class="box op" x="105" y="327" width="540" height="62" />
+  <text class="label" x="130" y="354">Token Embedding</text>
+  <text class="small" x="130" y="376">查表 / gather：input_ids -> hidden states [B, S, 896]</text>
+
+  <!-- Prefill transformer group -->
+  <path class="arrow" d="M375 389 V424" />
+  <rect class="group" x="82" y="405" width="596" height="365" />
+  <text class="groupTitle" x="105" y="428">Transformer 主干与 KV 写入</text>
+  <rect class="box layer" x="105" y="445" width="540" height="246" />
+  <text class="label" x="130" y="475">重复 24 次：Qwen2DecoderLayer</text>
+
+  <rect class="soft op" x="130" y="502" width="230" height="48" />
+  <text class="small" x="147" y="524">RMSNorm</text>
+  <text class="tiny" x="147" y="542">pow / mean / rsqrt / mul</text>
+
+  <rect class="soft op" x="390" y="502" width="230" height="48" />
+  <text class="small" x="407" y="524">Q/K/V Linear</text>
+  <text class="tiny" x="407" y="542">GEMM：q_proj,k_proj,v_proj</text>
+
+  <rect class="soft op" x="130" y="565" width="230" height="48" />
+  <text class="small" x="147" y="587">RoPE 位置编码</text>
+  <text class="tiny" x="147" y="605">sin / cos / mul / add</text>
+
+  <rect class="soft op" x="390" y="565" width="230" height="48" />
+  <text class="small" x="407" y="587">Causal Self-Attention</text>
+  <text class="tiny" x="407" y="605">QK^T / scale / mask / softmax / AV</text>
+
+  <rect class="soft op" x="130" y="628" width="230" height="48" />
+  <text class="small" x="147" y="650">o_proj + residual</text>
+  <text class="tiny" x="147" y="668">GEMM / add</text>
+
+  <rect class="soft op" x="390" y="628" width="230" height="48" />
+  <text class="small" x="407" y="650">MLP + residual</text>
+  <text class="tiny" x="407" y="668">gate/up / SiLU / mul / down</text>
+
+  <path class="arrow" d="M375 676 V694" />
+  <rect class="box cache" x="150" y="694" width="450" height="62" />
+  <text class="label" x="175" y="721">写入 KV Cache</text>
+  <text class="small" x="175" y="743">每层保存 K,V：[B, 2, S, 64]，供 decode 复用</text>
+
+  <!-- Prefill output group -->
+  <path class="arrow" d="M375 770 V804" />
+  <rect class="group" x="82" y="790" width="596" height="180" />
+  <text class="groupTitle" x="105" y="813">输出与采样起点</text>
+  <rect class="box out" x="105" y="830" width="540" height="62" />
+  <text class="label" x="130" y="856">Final RMSNorm + lm_head</text>
+  <text class="small" x="130" y="878">得到 logits [B, S, 151936]，通常取最后位置采样首个新 token</text>
+
+  <path class="arrow" d="M375 892 V912" />
+  <rect class="box out" x="205" y="912" width="340" height="42" />
+  <text class="label" x="230" y="939">采样 / argmax -> 首个新 token</text>
+
+  <!-- Decode input group -->
+  <rect class="group" x="1122" y="190" width="596" height="210" />
+  <text class="groupTitle" x="1145" y="213">输入与嵌入</text>
+  <rect class="box decode" x="1145" y="230" width="540" height="62" />
+  <text class="label" x="1170" y="257">当前输入 token id</text>
+  <text class="small" x="1170" y="279">形状：[B, 1]，通常是刚生成的 token</text>
+
+  <path class="arrow" d="M1415 292 V327" />
+  <rect class="box op" x="1145" y="327" width="540" height="62" />
+  <text class="label" x="1170" y="354">Token Embedding</text>
+  <text class="small" x="1170" y="376">查表 / gather：得到 hidden states [B, 1, 896]</text>
+
+  <!-- Decode transformer group -->
+  <path class="arrow" d="M1415 389 V424" />
+  <rect class="group" x="1122" y="405" width="596" height="365" />
+  <text class="groupTitle" x="1145" y="428">Transformer 主干与 KV 读取/追加</text>
+  <rect class="box layer" x="1145" y="445" width="540" height="246" />
+  <text class="label" x="1170" y="475">重复 24 次：带 KV Cache 的 DecoderLayer</text>
+
+  <rect class="soft op" x="1170" y="502" width="230" height="48" />
+  <text class="small" x="1187" y="524">RMSNorm</text>
+  <text class="tiny" x="1187" y="542">只处理当前 1 个 token</text>
+
+  <rect class="soft op" x="1430" y="502" width="230" height="48" />
+  <text class="small" x="1447" y="524">Q/K/V Linear</text>
+  <text class="tiny" x="1447" y="542">GEMM：生成当前步 Q,K,V</text>
+
+  <rect class="soft op" x="1170" y="565" width="230" height="48" />
+  <text class="small" x="1187" y="587">RoPE + 追加 Cache</text>
+  <text class="tiny" x="1187" y="605">当前 K,V 写到第 S+1 位置</text>
+
+  <rect class="soft op" x="1430" y="565" width="230" height="48" />
+  <text class="small" x="1447" y="587">Attention over Cache</text>
+  <text class="tiny" x="1447" y="605">Q 与历史 K 做 QK^T，再乘 V</text>
+
+  <rect class="soft op" x="1170" y="628" width="230" height="48" />
+  <text class="small" x="1187" y="650">o_proj + residual</text>
+  <text class="tiny" x="1187" y="668">GEMM / add</text>
+
+  <rect class="soft op" x="1430" y="628" width="230" height="48" />
+  <text class="small" x="1447" y="650">MLP + residual</text>
+  <text class="tiny" x="1447" y="668">gate/up / SiLU / mul / down</text>
+
+  <path class="arrow" d="M1415 676 V694" />
+  <rect class="box cache" x="1170" y="694" width="490" height="62" />
+  <text class="label" x="1195" y="721">读取并更新 KV Cache</text>
+  <text class="small" x="1195" y="743">读历史 [B,2,S,64]，追加当前步变成 [B,2,S+1,64]</text>
+
+  <!-- Decode output group -->
+  <path class="arrow" d="M1415 770 V804" />
+  <rect class="group" x="1122" y="790" width="596" height="180" />
+  <text class="groupTitle" x="1145" y="813">输出与下一个 token</text>
+  <rect class="box out" x="1145" y="830" width="540" height="62" />
+  <text class="label" x="1170" y="856">Final RMSNorm + lm_head</text>
+  <text class="small" x="1170" y="878">只得到当前位置 logits [B, 1, 151936]</text>
+
+  <path class="arrow" d="M1415 892 V912" />
+  <rect class="box out" x="1245" y="912" width="340" height="42" />
+  <text class="label" x="1270" y="939">采样 / argmax -> 新 token</text>
+
+  <!-- Cross-stage cache note in the widened gap -->
+  <rect class="box cache" x="735" y="585" width="330" height="82" />
+  <text class="label" x="760" y="617">KV Cache 是两阶段的桥</text>
+  <text class="small" x="760" y="641">Prefill 写入完整 prompt 的 K,V</text>
+  <text class="small" x="760" y="659">Decode 每步读取历史并追加当前 K,V</text>
+
+  <path class="cacheArrow" d="M600 725 C680 725, 690 626, 735 626" />
+  <path class="cacheArrow" d="M1065 626 C1110 626, 1100 725, 1170 725" />
+
+  <text class="tiny" x="60" y="998">注：实际推理后端可能把 RMSNorm、RoPE、Attention、SwiGLU 等融合成更大的 kernel，但计算依赖关系与图中一致。</text>
+</svg>

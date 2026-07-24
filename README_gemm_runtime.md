@@ -2,25 +2,60 @@
 
 本测试使用 CUTLASS TensorOp GEMM，根据 Qwen2.5 模型参数生成 Decode 和 Prefill 阶段的 `M/N/K`，按 `M/N/K` 去重后运行，并从内置候选配置中选择实测性能最佳的结果。
 
-## 文件放置
+## 目录结构与文件用途
 
-将交付文件放入 CUTLASS 源码根目录，形成以下结构：
+Qwen GEMM 文件不是 CUTLASS 上游原生产物。根目录只保留运行入口和两版
+README，辅助脚本归档到 `tools/qwen_gemm`，生成结果写入
+`outputs/qwen_gemm`：
 
 ```text
 cutlass/
+├── README_gemm.md
 ├── README_gemm_runtime.md
 ├── build_gemm.sh
 ├── run_gemm.sh
-├── collect_gemm_results.py
-├── estimate_qwen_gemm.py
+├── tune_optimal_cutlass.sh
+├── examples/gemm/
+│   ├── gemm.cu
+│   ├── cublaslt_profiler.cu
+│   ├── optimal_configurations.inc
+│   ├── ncu_exact_configurations.inc       # 可选
+│   └── cublaslt_generated_candidates.inc
+├── tools/qwen_gemm/
+│   ├── collect_gemm_results.py
+│   ├── estimate_qwen_gemm.py
+│   ├── generate_qwen_shapes.py
+│   ├── generate_cutlass_candidates.py
+│   ├── generate_optimal_configurations.py
+│   └── tune_cutlass_from_cublaslt.sh
+├── docs/qwen_gemm/
+│   ├── GEMM_CODE_GUIDE.md
+│   ├── qwen2.5推理中gemm算子使用.docx
+│   └── qwen2_5_0_5b_prefill_decode_flow.svg
+└── outputs/qwen_gemm/                 # 可重新生成，不提交 Git
+
+../../qwen_gemm_artifacts/             # CUTLASS 仓库外
+├── qwen_decode_gemm_package.tar.gz
 ├── gemm_performance_comparison.xlsx
-├── include/
-├── tools/
-└── examples/
-    └── gemm/
-        ├── gemm.cu
-        └── optimal_configurations.inc  # 可选的精确 M/N/K 最优映射
+├── up_gate_test.log
+└── up_gate_test.xlsx
 ```
+
+| 文件 | 用途 |
+|---|---|
+| `README_gemm_runtime.md` | 不依赖调优过程的构建、运行和结果处理说明 |
+| `build_gemm.sh` | 编译 GEMM，选择架构、计时器、累加器及 optimal-only |
+| `run_gemm.sh` | 根据模型参数运行 Decode/Prefill 全量用例 |
+| `gemm.cu` | CUTLASS FP16 输入、FP32 默认累加的 GEMM 测试主体 |
+| `optimal_configurations.inc` | 可选的 optimal-only 精确配置 |
+| `ncu_exact_configurations.inc` | 可选 NCU-exact 严格映射；仅 `--ncu-exact` 构建需要 |
+| `collect_gemm_results.py` | 将运行日志结果写入仓外对比工作簿 |
+| `estimate_qwen_gemm.py` | 根据实测时间估算 Qwen GEMM-only forward |
+| `GEMM_CODE_GUIDE.md` | `gemm.cu` 模块结构与维护同步说明 |
+| `qwen2.5推理中gemm算子使用.docx` | 0.5B 实测 cuBLAS 调用参数和接口参考 |
+| `qwen2_5_0_5b_prefill_decode_flow.svg` | Prefill/Decode 流程与 GEMM 位置图 |
+| `outputs/qwen_gemm` | 日志、清单、二进制和调优中间结果 |
+| `qwen_gemm_artifacts` | CUTLASS 仓外的交付包、工作簿和历史测试结果 |
 
 `build_gemm.sh` 和 `run_gemm.sh` 必须从 CUTLASS 根目录执行。
 
@@ -37,7 +72,7 @@ cutlass/
 
 ```text
 Element A/B/C    = half
-Accumulator      = half（默认）或 float
+Accumulator      = float（默认）或 half
 OperatorClass    = OpClassTensorOp
 ArchTag          = Sm80
 InstructionShape = 16x8x16
@@ -55,6 +90,9 @@ FP16 Tensor Core 输入、FP32 accumulator 和 FP32 epilogue compute，最终 D
 仍转换并写回 FP16。当前构建脚本正式支持 `fp16`、`fp32`；源码通过统一的
 `GEMM_ACCUMULATOR_TYPE` 类型入口组织，扩展其他类型时还必须确认输入类型、
 InstructionShape、OperatorClass 和目标架构支持该组合。
+
+不指定 `--accumulator` 时默认采用 `fp32`，即 A/B/C/D 为 FP16（用于近似
+BF16），FP32 累加和 FP32 Epilogue compute，最终 D 写回 FP16。
 
 ## 编译
 
@@ -281,10 +319,10 @@ cuda_error: 700 (cudaErrorIllegalAddress: an illegal memory access was encounter
 
 ```bash
 bash run_gemm.sh --model 7b --stage prefill --lengths 128 | tee cutlass_prefill.log
-python3 estimate_qwen_gemm.py --log cutlass_prefill.log --model 7b --stage prefill --length 128
+python3 tools/qwen_gemm/estimate_qwen_gemm.py --log cutlass_prefill.log --model 7b --stage prefill --length 128
 
 bash run_gemm.sh --model 7b --stage decode --lengths 129 | tee cutlass_decode.log
-python3 estimate_qwen_gemm.py --log cutlass_decode.log --model 7b --stage decode --length 129
+python3 tools/qwen_gemm/estimate_qwen_gemm.py --log cutlass_decode.log --model 7b --stage decode --length 129
 ```
 
 Prompt 长度为 `P` 时，Prefill 使用 `S=P`，下一次 Decode forward 使用 `L=P+1`。脚本按 Qwen2.5 模型层数汇总，对 Q/Out、K/V、Up/Gate 各计两次，LM Head 只计一次。整模型延迟应累加 `avg_time × 调用次数`，不能平均各用例 GFLOPS。
@@ -336,14 +374,14 @@ bash run_gemm.sh --model "$MODEL" --stage decode --lengths "$DECODE_LENGTHS" \
 
 ```bash
 PREFILL_MS=$(
-  python3 estimate_qwen_gemm.py --log "prefill_s${S}.log" \
+  python3 tools/qwen_gemm/estimate_qwen_gemm.py --log "prefill_s${S}.log" \
     --model "$MODEL" --stage prefill --length "$S" \
   | awk '/GEMM-only lower-bound latency:/ {print $4}'
 )
 
 DECODE_MS=$(
   for L in $(seq "$FIRST_L" "$LAST_L"); do
-    python3 estimate_qwen_gemm.py --log "decode_s${S}_g${G}.log" \
+    python3 tools/qwen_gemm/estimate_qwen_gemm.py --log "decode_s${S}_g${G}.log" \
       --model "$MODEL" --stage decode --length "$L"
   done \
   | awk '/GEMM-only lower-bound latency:/ {sum += $4} END {printf "%.6f", sum}'
@@ -373,21 +411,21 @@ bash run_gemm.sh --model 7b --stage prefill | tee cutlass_prefill.log
 更新原始 XLSX：
 
 ```bash
-python3 collect_gemm_results.py \
+python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_decode.log \
-  --workbook gemm_performance_comparison.xlsx
+  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
 
-python3 collect_gemm_results.py \
+python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook gemm_performance_comparison.xlsx
+  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
 ```
 
 输出到新文件：
 
 ```bash
-python3 collect_gemm_results.py \
+python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook gemm_performance_comparison.xlsx \
+  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx \
   --output gemm_performance_comparison_filled.xlsx
 ```
 
@@ -400,3 +438,28 @@ python3 collect_gemm_results.py \
 - alignment=1 的 FP16 访问为2字节，不能使用 SM80 `cp.async`，因此固定采用同步 `MmaPipelined` Stages 2。
 - LM Head 固定使用 `M=1`，只计算最后位置 logits；部分 MLP 用例仍需要较大的主机内存与 GPU显存。
 - 更换 GPU、CUDA版本或 `.inc` 后必须重新执行 build。
+## cuBLAS 调用语义
+
+`run_gemm.sh` 会按 Qwen2.5 实际操作数关系传递 `--operation`、
+`--operand-a`、`--operand-b` 和 `--trans`。Linear 类使用
+`A=Weight,B=Activation,TN`，Attention QK^T 使用 `A=K,B=Q,TN`，
+Attention PV 使用 `A=V,B=P,NN`。这里的 M/N/K 是 cuBLAS 列主序调用
+尺寸，因此与模型行主序表达相比，M/N 会交换。
+直接运行二进制时，只指定标准 `--operation` 也会自动得到相同的 A/B
+和 trans；显式指定的覆盖参数优先。
+
+单独模拟一次 Q projection：
+
+```bash
+./examples/gemm/gemm --m=896 --n=6 --k=896 \
+  --operation=q_proj --operand-a=W_Q --operand-b=HiddenStates --trans=TN
+```
+
+程序也接受 NN/NT/TN/TT，但只改 `trans` 会改变数学问题。做等价性能
+比较时必须同步准备正确的 A/B 数据、操作数顺序和 M/N/K。
+
+Attention 使用 `--batch-count=batch*heads` 的 strided-batched GEMM；
+M/N/K 保持单个 Head 的实际调用尺寸。GFLOPS、初始化和正确性校验均包含
+全部 batch。Linear/MLP/LM Head 的 `batch-count` 为 1。
+其中 Decode Attention 固定 `N=1`，Prefill Attention 固定 `N=S`；
+batch size 只通过 `batch-count` 表达，不会同时合并进 N。

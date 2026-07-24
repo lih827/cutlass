@@ -3,11 +3,17 @@
  *
  * Computes D = alpha * A * B + beta * C with half precision A/B/C/D
  * and a build-time selectable accumulator type.
+ *
+ * Code guide:
+ *   docs/qwen_gemm/GEMM_CODE_GUIDE.md
+ * Keep the guide synchronized when changing operation/trans/batch semantics,
+ * candidate dispatch, logging fields, or optimal configuration keys.
  **************************************************************************************************/
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -49,6 +55,12 @@ constexpr bool kOptimalOnly = true;
 constexpr bool kOptimalOnly = false;
 #endif
 
+#if defined(GEMM_NCU_EXACT_ONLY) && GEMM_NCU_EXACT_ONLY
+constexpr bool kNcuExactOnly = true;
+#else
+constexpr bool kNcuExactOnly = false;
+#endif
+
 #if defined(GEMM_SKIP_VERIFICATION) && GEMM_SKIP_VERIFICATION
 constexpr bool kVerifyResults = false;
 #else
@@ -60,7 +72,7 @@ using ElementB = cutlass::half_t;
 using ElementC = cutlass::half_t;
 
 #if !defined(GEMM_ACCUMULATOR_TYPE)
-#define GEMM_ACCUMULATOR_TYPE cutlass::half_t
+#define GEMM_ACCUMULATOR_TYPE float
 #endif
 
 // Keep the selected type in one alias so another accumulator can be added by
@@ -198,6 +210,19 @@ struct ConfigName {
   static char const *value() { return "unknown"; }
 };
 
+template <typename T>
+struct ConfigToken;
+
+template <>
+struct ConfigToken<cutlass::layout::RowMajor> {
+  static char const *value() { return "cutlass::layout::RowMajor"; }
+};
+
+template <>
+struct ConfigToken<cutlass::layout::ColumnMajor> {
+  static char const *value() { return "cutlass::layout::ColumnMajor"; }
+};
+
 template <>
 struct ConfigName<cutlass::half_t> {
   static char const *value() { return "half"; }
@@ -248,8 +273,58 @@ struct Options {
   float beta = 0.0f;
   int iterations = 20;
   int split_k_slices = 1;  // Set by generated cuBLASLt-derived dispatch.
+  int batch_count = 1;
+  std::string operation = "generic";
+  std::string operand_a = "A";
+  std::string operand_b = "B";
+  std::string trans = "NN";
+  bool trans_explicit = false;
+  bool operand_a_explicit = false;
+  bool operand_b_explicit = false;
+
+  void apply_operation_defaults() {
+    std::string key = operation;
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+    std::replace(key.begin(), key.end(), '-', '_');
+
+    char const *default_a = nullptr;
+    char const *default_b = nullptr;
+    char const *default_trans = nullptr;
+    if (key == "q" || key == "q_proj") {
+      default_a = "W_Q"; default_b = "HiddenStates"; default_trans = "TN";
+    } else if (key == "k" || key == "k_proj") {
+      default_a = "W_K"; default_b = "HiddenStates"; default_trans = "TN";
+    } else if (key == "v" || key == "v_proj") {
+      default_a = "W_V"; default_b = "HiddenStates"; default_trans = "TN";
+    } else if (key == "o" || key == "o_proj" ||
+               key == "attention_out") {
+      default_a = "W_O"; default_b = "AttentionOutput"; default_trans = "TN";
+    } else if (key == "mlp_up" || key == "up_proj") {
+      default_a = "W_up"; default_b = "MLPInput"; default_trans = "TN";
+    } else if (key == "mlp_gate" || key == "gate_proj") {
+      default_a = "W_gate"; default_b = "MLPInput"; default_trans = "TN";
+    } else if (key == "mlp_down" || key == "down_proj") {
+      default_a = "W_down"; default_b = "SwiGLUOutput"; default_trans = "TN";
+    } else if (key == "lm_head") {
+      default_a = "W_lm_head"; default_b = "LastHiddenState"; default_trans = "TN";
+    } else if (key == "qk" || key == "qk_t" ||
+               key == "attention_qk_t") {
+      default_a = "K"; default_b = "Q"; default_trans = "TN";
+    } else if (key == "pv" || key == "attention_pv" || key == "av") {
+      default_a = "V"; default_b = "P"; default_trans = "NN";
+    }
+    if (default_a && !operand_a_explicit) operand_a = default_a;
+    if (default_b && !operand_b_explicit) operand_b = default_b;
+    if (default_trans && !trans_explicit) trans = default_trans;
+  }
 
   void parse(int argc, char const **argv) {
+    for (int index = 1; index < argc; ++index) {
+      std::string argument(argv[index]);
+      trans_explicit |= argument.rfind("--trans=", 0) == 0;
+      operand_a_explicit |= argument.rfind("--operand-a=", 0) == 0;
+      operand_b_explicit |= argument.rfind("--operand-b=", 0) == 0;
+    }
     cutlass::CommandLine cmd(argc, argv);
     help = cmd.check_cmd_line_flag("help");
     cmd.get_cmd_line_argument("m", m);
@@ -258,18 +333,22 @@ struct Options {
     cmd.get_cmd_line_argument("alpha", alpha);
     cmd.get_cmd_line_argument("beta", beta);
     cmd.get_cmd_line_argument("iterations", iterations);
+    cmd.get_cmd_line_argument("batch-count", batch_count);
+    cmd.get_cmd_line_argument("operation", operation);
+    cmd.get_cmd_line_argument("operand-a", operand_a);
+    cmd.get_cmd_line_argument("operand-b", operand_b);
+    cmd.get_cmd_line_argument("trans", trans);
+    apply_operation_defaults();
+    std::transform(trans.begin(), trans.end(), trans.begin(), ::toupper);
   }
 
   bool valid() const {
-    if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0) {
+    if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0 || batch_count <= 0 ||
+        (trans != "NN" && trans != "NT" &&
+         trans != "TN" && trans != "TT")) {
       return false;
     }
-    if (m == 1) {
-      return (k % kAlignmentAM1 == 0) &&
-             (k % kAlignmentBM1 == 0) &&
-             (n % kAlignmentCM1 == 0);
-    }
-    return true;  // Non-aligned M/K use the Alignment=1 synchronous fallback.
+    return true;
   }
 
   void print_usage(char const *program) const {
@@ -281,8 +360,20 @@ struct Options {
         << "  --alpha=<float>      Epilogue alpha (default: 1.0)\n"
         << "  --beta=<float>       Epilogue beta (default: 0.0)\n"
         << "  --iterations=<int>   Timed iterations (default: 20)\n"
+        << "  --batch-count=<int>  Strided-batched GEMM count (default: 1)\n"
+        << "  --operation=<name>   Qwen operation; supplies default A/B/trans\n"
+        << "  --operand-a=<name>   Override Qwen tensor used as cuBLAS operand A\n"
+        << "  --operand-b=<name>   Override Qwen tensor used as cuBLAS operand B\n"
+        << "  --trans=NN|NT|TN|TT  Override operation's cuBLAS trans semantics\n"
         << "  --help               Show this message\n";
   }
+
+  bool transa() const { return trans[0] == 'T'; }
+  bool transb() const { return trans[1] == 'T'; }
+  int physical_a_rows() const { return transa() ? k : m; }
+  int physical_a_cols() const { return transa() ? m : k; }
+  int physical_b_rows() const { return transb() ? n : k; }
+  int physical_b_cols() const { return transb() ? k : n; }
 };
 
 template <typename LayoutA_, typename LayoutB_, typename LayoutC_>
@@ -296,6 +387,9 @@ struct Tensors {
   cutlass::HostTensor<ElementC, LayoutC> c;
   cutlass::HostTensor<ElementC, LayoutC> d;
   cutlass::HostTensor<ElementC, LayoutC> reference;
+  int64_t batch_stride_a = 0;
+  int64_t batch_stride_b = 0;
+  int64_t batch_stride_c = 0;
 };
 
 struct Result {
@@ -311,6 +405,9 @@ struct Result {
 struct GeneratedCandidateResult {
   bool available = false;
   std::string name;
+  std::string source = "cublaslt-derived";
+  std::string layout_a, layout_b, layout_c;
+  std::string swizzle = "Identity";
   Result result;
   int threadblock_m = 0, threadblock_n = 0, threadblock_k = 0;
   int warp_m = 0, warp_n = 0, warp_k = 0;
@@ -335,20 +432,29 @@ bool initialize_tensors(Options const &options, TensorSet &tensors) {
   tensors.b.resize({options.k, options.n});
   tensors.c.resize({options.m, options.n});
   tensors.d.resize({options.m, options.n});
+  tensors.batch_stride_a = tensors.a.layout().capacity({options.m, options.k});
+  tensors.batch_stride_b = tensors.b.layout().capacity({options.k, options.n});
+  tensors.batch_stride_c = tensors.c.layout().capacity({options.m, options.n});
+  tensors.a.reserve(size_t(tensors.batch_stride_a) * options.batch_count);
+  tensors.b.reserve(size_t(tensors.batch_stride_b) * options.batch_count);
+  tensors.c.reserve(size_t(tensors.batch_stride_c) * options.batch_count);
+  tensors.d.reserve(size_t(tensors.batch_stride_c) * options.batch_count);
   if constexpr (kVerifyResults) {
     tensors.reference.resize({options.m, options.n});
+    tensors.reference.reserve(
+        size_t(tensors.batch_stride_c) * options.batch_count);
   }
 
   if constexpr (!kVerifyResults) {
     CUDA_RETURN_IF_ERROR(cudaMemset(
         tensors.a.device_data(), 0,
-        size_t(options.m) * options.k * sizeof(ElementA)));
+        size_t(tensors.batch_stride_a) * options.batch_count * sizeof(ElementA)));
     CUDA_RETURN_IF_ERROR(cudaMemset(
         tensors.b.device_data(), 0,
-        size_t(options.k) * options.n * sizeof(ElementB)));
+        size_t(tensors.batch_stride_b) * options.batch_count * sizeof(ElementB)));
     CUDA_RETURN_IF_ERROR(cudaMemset(
         tensors.c.device_data(), 0,
-        size_t(options.m) * options.n * sizeof(ElementC)));
+        size_t(tensors.batch_stride_c) * options.batch_count * sizeof(ElementC)));
     return true;
   }
 
@@ -361,6 +467,19 @@ bool initialize_tensors(Options const &options, TensorSet &tensors) {
   if constexpr (kVerifyResults) {
     cutlass::reference::host::TensorFill(tensors.d.host_view(), ElementC(0));
     cutlass::reference::host::TensorFill(tensors.reference.host_view(), ElementC(0));
+  }
+
+  for (int batch = 1; batch < options.batch_count; ++batch) {
+    std::copy_n(tensors.a.host_data(), tensors.batch_stride_a,
+                tensors.a.host_data() + batch * tensors.batch_stride_a);
+    std::copy_n(tensors.b.host_data(), tensors.batch_stride_b,
+                tensors.b.host_data() + batch * tensors.batch_stride_b);
+    std::copy_n(tensors.c.host_data(), tensors.batch_stride_c,
+                tensors.c.host_data() + batch * tensors.batch_stride_c);
+    std::copy_n(tensors.d.host_data(), tensors.batch_stride_c,
+                tensors.d.host_data() + batch * tensors.batch_stride_c);
+    std::copy_n(tensors.reference.host_data(), tensors.batch_stride_c,
+                tensors.reference.host_data() + batch * tensors.batch_stride_c);
   }
 
   tensors.a.sync_device();
@@ -382,10 +501,20 @@ bool compute_reference(Options const &options, TensorSet &tensors) {
       ElementC, typename TensorSet::LayoutC,
       ElementAccumulator, ElementCompute>;
   ReferenceGemm reference_gemm;
-  reference_gemm(
-      {options.m, options.n, options.k},
-      ElementCompute(options.alpha), tensors.a.device_ref(), tensors.b.device_ref(),
-      ElementCompute(options.beta), tensors.c.device_ref(), tensors.reference.device_ref());
+  for (int batch = 0; batch < options.batch_count; ++batch) {
+    typename TensorSet::LayoutA layout_a = tensors.a.layout();
+    typename TensorSet::LayoutB layout_b = tensors.b.layout();
+    typename TensorSet::LayoutC layout_c = tensors.c.layout();
+    reference_gemm(
+        {options.m, options.n, options.k},
+        ElementCompute(options.alpha),
+        {tensors.a.device_data() + batch * tensors.batch_stride_a, layout_a},
+        {tensors.b.device_data() + batch * tensors.batch_stride_b, layout_b},
+        ElementCompute(options.beta),
+        {tensors.c.device_data() + batch * tensors.batch_stride_c, layout_c},
+        {tensors.reference.device_data() + batch * tensors.batch_stride_c,
+         layout_c});
+  }
 
   CUDA_RETURN_IF_ERROR(cudaGetLastError());
   CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
@@ -398,16 +527,15 @@ struct ArgumentFactory {
   template <typename TensorSet>
   static typename Gemm::Arguments make(Options const &options, TensorSet &tensors) {
     return typename Gemm::Arguments(
-        cutlass::gemm::GemmUniversalMode::kGemm,
+        options.batch_count > 1 ? cutlass::gemm::GemmUniversalMode::kBatched
+                                : cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
-        options.split_k_slices,
+        options.batch_count > 1 ? options.batch_count : options.split_k_slices,
         {ElementCompute(options.alpha), ElementCompute(options.beta)},
         tensors.a.device_data(), tensors.b.device_data(),
         tensors.c.device_data(), tensors.d.device_data(),
-        int64_t(options.m) * options.k,
-        int64_t(options.k) * options.n,
-        int64_t(options.m) * options.n,
-        int64_t(options.m) * options.n,
+        tensors.batch_stride_a, tensors.batch_stride_b,
+        tensors.batch_stride_c, tensors.batch_stride_c,
         tensors.a.layout().stride(0), tensors.b.layout().stride(0),
         tensors.c.layout().stride(0), tensors.d.layout().stride(0));
   }
@@ -419,16 +547,15 @@ struct ArgumentFactory<
   template <typename TensorSet>
   static typename Gemm::Arguments make(Options const &options, TensorSet &tensors) {
     return typename Gemm::Arguments(
-        cutlass::gemm::GemmUniversalMode::kGemm,
+        options.batch_count > 1 ? cutlass::gemm::GemmUniversalMode::kBatched
+                                : cutlass::gemm::GemmUniversalMode::kGemm,
         {options.m, options.n, options.k},
-        options.split_k_slices,
+        options.batch_count > 1 ? options.batch_count : options.split_k_slices,
         {ElementCompute(options.alpha), ElementCompute(options.beta)},
         tensors.a.device_data(), tensors.b.device_data(),
         tensors.c.device_data(), tensors.d.device_data(),
-        int64_t(options.m) * options.k,
-        int64_t(options.k) * options.n,
-        int64_t(options.m) * options.n,
-        int64_t(options.m) * options.n,
+        tensors.batch_stride_a, tensors.batch_stride_b,
+        tensors.batch_stride_c, tensors.batch_stride_c,
         tensors.a.layout().stride(0), tensors.b.layout().stride(0),
         tensors.c.layout().stride(0), tensors.d.layout().stride(0),
         -1);
@@ -577,7 +704,8 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
   }
 
   result.avg_time_ms = double(elapsed_ms) / options.iterations;
-  result.gflops = 2.0 * double(options.m) * double(options.n) * double(options.k) /
+  result.gflops = 2.0 * double(options.m) * double(options.n) *
+                  double(options.k) * double(options.batch_count) /
                   (result.avg_time_ms * 1.0e6);
 
   if constexpr (kVerifyResults) {
@@ -587,8 +715,15 @@ Result run_tensorop_gemm(Options const &options, TensorSet &tensors) {
       fail_cuda("verification_copy", __LINE__, cuda_error);
       return result;
     }
-    result.passed = cutlass::reference::host::TensorEquals(
-        tensors.d.host_view(), tensors.reference.host_view());
+    result.passed = true;
+    size_t const output_elements =
+        size_t(tensors.batch_stride_c) * options.batch_count;
+    for (size_t index = 0; index < output_elements; ++index) {
+      if (tensors.d.host_data()[index] != tensors.reference.host_data()[index]) {
+        result.passed = false;
+        break;
+      }
+    }
     if (!result.passed) {
       result.failure_stage = "verification_compare";
       result.failure_line = __LINE__;
@@ -604,8 +739,17 @@ void print_configuration(char const *configuration_name, Options const &options)
   std::cout
       << "\nGEMM configuration: " << configuration_name << "\n"
       << "  Problem: " << options.m << " x " << options.n << " x " << options.k << "\n"
+      << "  Qwen operation: " << options.operation << "\n"
+      << "  cuBLAS operands: A=" << options.operand_a
+      << ", B=" << options.operand_b << "\n"
+      << "  cuBLAS trans: " << options.trans << "\n"
+      << "  physical A/B: "
+      << options.physical_a_rows() << "x" << options.physical_a_cols()
+      << " / " << options.physical_b_rows() << "x"
+      << options.physical_b_cols() << "\n"
       << "  alpha / beta: " << options.alpha << " / " << options.beta << "\n"
       << "  iterations: " << options.iterations << "\n"
+      << "  batch count: " << options.batch_count << "\n"
       << "  verification: " << (kVerifyResults ? "enabled" : "disabled") << "\n"
       << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
       << "  split-K slices: " << options.split_k_slices << "\n"
@@ -680,11 +824,16 @@ void print_cutlass_record(char const *record_type, char const *source,
   std::cout << std::fixed << std::setprecision(6)
             << record_type
             << " m=" << options.m << " n=" << options.n << " k=" << options.k
+            << " operation=" << options.operation
+            << " operand_a=" << options.operand_a
+            << " operand_b=" << options.operand_b
+            << " trans=" << options.trans
+            << " batch_count=" << options.batch_count
             << " source=" << source << " name=" << configuration_name
             << " accumulator=" << ConfigName<ElementAccumulator>::value()
-            << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
-            << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
-            << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
+            << " layout_a=" << ConfigToken<typename Gemm::LayoutA>::value()
+            << " layout_b=" << ConfigToken<typename Gemm::LayoutB>::value()
+            << " layout_c=" << ConfigToken<typename Gemm::LayoutC>::value()
             << " align_a=" << Gemm::kAlignmentA
             << " align_b=" << Gemm::kAlignmentB
             << " align_c=" << Gemm::kAlignmentC
@@ -712,18 +861,23 @@ void print_generated_record(char const *record_type, Options const &options,
   std::cout << std::fixed << std::setprecision(6)
             << record_type
             << " m=" << options.m << " n=" << options.n << " k=" << options.k
-            << " source=cublaslt-derived name=" << g.name
+            << " operation=" << options.operation
+            << " operand_a=" << options.operand_a
+            << " operand_b=" << options.operand_b
+            << " trans=" << options.trans
+            << " batch_count=" << options.batch_count
+            << " source=" << g.source << " name=" << g.name
             << " accumulator=" << ConfigName<ElementAccumulator>::value()
-            << " layout_a=" << (options.m == 1 ? "LayoutAM1" : "LayoutAAttention")
-            << " layout_b=" << (options.m == 1 ? "LayoutBM1" : "LayoutBAttention")
-            << " layout_c=" << (options.m == 1 ? "LayoutCM1" : "LayoutCAttention")
+            << " layout_a=" << g.layout_a
+            << " layout_b=" << g.layout_b
+            << " layout_c=" << g.layout_c
             << " align_a=" << g.alignment_a << " align_b=" << g.alignment_b
             << " align_c=" << g.alignment_c
             << " tb_m=" << g.threadblock_m << " tb_n=" << g.threadblock_n
             << " tb_k=" << g.threadblock_k
             << " warp_m=" << g.warp_m << " warp_n=" << g.warp_n
             << " warp_k=" << g.warp_k
-            << " swizzle=Identity stages=" << g.stages
+            << " swizzle=" << g.swizzle << " stages=" << g.stages
             << " split_k=" << g.split_k_slices
             << " valid=" << ((result.status == cutlass::Status::kSuccess && result.passed) ? 1 : 0)
             << " failure_stage=" << result.failure_stage
@@ -743,9 +897,8 @@ void print_generated_configuration(Options const &options) {
             << "  verification: " << (kVerifyResults ? "enabled" : "disabled") << "\n"
             << "  timer: " << (kUseChronoTimer ? "chrono" : "cuda-event") << "\n"
             << "  split-K slices: " << g.split_k_slices << "\n"
-            << "  A: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
-            << "  B: half, column-major\n"
-            << "  C: half, " << (options.m == 1 ? "row-major" : "column-major") << "\n"
+            << "  layout A/B/C: " << g.layout_a << " / " << g.layout_b
+            << " / " << g.layout_c << "\n"
             << "  accumulator: " << ConfigName<ElementAccumulator>::value() << "\n"
             << "  operator class / arch: OpClassTensorOp / Sm80\n"
             << "  threadblock: " << g.threadblock_m << "x" << g.threadblock_n << "x" << g.threadblock_k << "\n"
@@ -753,7 +906,7 @@ void print_generated_configuration(Options const &options) {
             << "  instruction: 16x8x16\n"
             << "  alignment A/B/C: " << g.alignment_a << " / " << g.alignment_b << " / " << g.alignment_c << "\n"
             << "  stages: " << g.stages << "\n"
-            << "  threadblock swizzle: Identity\n";
+            << "  threadblock swizzle: " << g.swizzle << "\n";
 }
 
 template <typename LayoutA, typename LayoutB, typename LayoutC,
@@ -1086,11 +1239,27 @@ int profile_optimal_template(char const *family, Options const &options,
 }
 
 int profile_optimal_only_candidate(Options const &options) {
+#define GEMM_OPTIMAL_ENTRY_TRANS_EX(ACCUMULATOR, M, N, K, TRANS, BATCH_COUNT, \
+                                    LAYOUT_A, LAYOUT_B, LAYOUT_C,             \
+                                    ALIGN_A, ALIGN_B, ALIGN_C,                \
+                                    TB_M, TB_N, TB_K, W_M, W_N, W_K,         \
+                                    SWIZZLE, STAGES, SPLIT_K)                 \
+  if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {       \
+    if (options.m == (M) && options.n == (N) && options.k == (K) &&          \
+        options.trans == (TRANS) && options.batch_count == (BATCH_COUNT)) {   \
+      return profile_optimal_template<                                        \
+          LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,           \
+          cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                        \
+          cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(         \
+              "Optimal", options, SPLIT_K);                                  \
+    }                                                                         \
+  }
 #define GEMM_OPTIMAL_ENTRY(ACCUMULATOR, M, N, K, LAYOUT_A, LAYOUT_B, LAYOUT_C, \
                            ALIGN_A, ALIGN_B, ALIGN_C,                           \
                            TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE, STAGES)   \
   if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {         \
-   if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+   if (options.operation == "generic" &&                                      \
+       options.m == (M) && options.n == (N) && options.k == (K)) {              \
     return profile_optimal_template<                                            \
         LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
         cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
@@ -1104,7 +1273,8 @@ int profile_optimal_only_candidate(Options const &options) {
                               TB_M, TB_N, TB_K, W_M, W_N, W_K, SWIZZLE,        \
                               STAGES, SPLIT_K)                                  \
   if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {         \
-   if (options.m == (M) && options.n == (N) && options.k == (K)) {              \
+   if (options.operation == "generic" &&                                      \
+       options.m == (M) && options.n == (N) && options.k == (K)) {              \
     return profile_optimal_template<                                            \
         LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,                \
         cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                             \
@@ -1117,6 +1287,7 @@ int profile_optimal_only_candidate(Options const &options) {
 #endif
 #undef GEMM_OPTIMAL_ENTRY_EX
 #undef GEMM_OPTIMAL_ENTRY
+#undef GEMM_OPTIMAL_ENTRY_TRANS_EX
   return -1;
 }
 
@@ -1179,6 +1350,11 @@ int profile_cublaslt_template(char const *name, int split_k_slices,
   }
   generated_candidate_result.available = true;
   generated_candidate_result.name = name;
+  generated_candidate_result.source = "cublaslt-derived";
+  generated_candidate_result.layout_a = ConfigToken<LayoutA>::value();
+  generated_candidate_result.layout_b = ConfigToken<LayoutB>::value();
+  generated_candidate_result.layout_c = ConfigToken<LayoutC>::value();
+  generated_candidate_result.swizzle = "Identity";
   generated_candidate_result.result = result;
   generated_candidate_result.threadblock_m = ThreadblockShape::kM;
   generated_candidate_result.threadblock_n = ThreadblockShape::kN;
@@ -1203,6 +1379,90 @@ int profile_cublaslt_generated_candidate(Options const &) {
 }
 #endif
 
+// Runs a template whose CTA M/N/K and stages were parsed from an NCU-captured
+// kernel name. Unlike cuBLASLt-derived generation, these four values are never
+// clamped or replaced. The remaining fields explicitly complete the CUTLASS
+// template and retain their separate provenance in the generated header.
+template <typename LayoutA, typename LayoutB, typename LayoutC,
+          int kAlignmentA, int kAlignmentB, int kAlignmentC,
+          typename ThreadblockShape, typename WarpShape,
+          typename ThreadblockSwizzle, int kStages>
+int profile_ncu_exact_candidate(char const *name, int split_k_slices,
+                                Options const &options) {
+  using Gemm = GemmConfiguration<
+      LayoutA, LayoutB, LayoutC, kAlignmentA, kAlignmentB, kAlignmentC,
+      ThreadblockShape, WarpShape, ThreadblockSwizzle, kStages>;
+  using TensorSet = Tensors<LayoutA, LayoutB, LayoutC>;
+  Options tuned_options = options;
+  tuned_options.split_k_slices = std::max(1, split_k_slices);
+  TensorSet tensors;
+  if (!initialize_tensors(tuned_options, tensors) ||
+      (kVerifyResults && !compute_reference(tuned_options, tensors))) {
+    return -1;
+  }
+  if (!kConciseLog) print_configuration<Gemm>(name, tuned_options);
+  Result result = run_tensorop_gemm<Gemm>(tuned_options, tensors);
+  print_cutlass_record<Gemm>(
+      "CUTLASS_CANDIDATE", "ncu-exact", name, tuned_options, result);
+  if (!kConciseLog) print_result(name, result);
+  if (result.status != cutlass::Status::kSuccess || !result.passed) {
+    std::cerr << "NCU-exact candidate was not runnable; continuing with "
+                 "the other tuning candidates.\n";
+    return -1;
+  }
+  if (!generated_candidate_result.available ||
+      result.avg_time_ms < generated_candidate_result.result.avg_time_ms) {
+    generated_candidate_result.available = true;
+    generated_candidate_result.name = name;
+    generated_candidate_result.source = "ncu-exact";
+    generated_candidate_result.layout_a = ConfigToken<LayoutA>::value();
+    generated_candidate_result.layout_b = ConfigToken<LayoutB>::value();
+    generated_candidate_result.layout_c = ConfigToken<LayoutC>::value();
+    generated_candidate_result.swizzle =
+        ConfigName<ThreadblockSwizzle>::value();
+    generated_candidate_result.result = result;
+    generated_candidate_result.threadblock_m = ThreadblockShape::kM;
+    generated_candidate_result.threadblock_n = ThreadblockShape::kN;
+    generated_candidate_result.threadblock_k = ThreadblockShape::kK;
+    generated_candidate_result.warp_m = WarpShape::kM;
+    generated_candidate_result.warp_n = WarpShape::kN;
+    generated_candidate_result.warp_k = WarpShape::kK;
+    generated_candidate_result.stages = kStages;
+    generated_candidate_result.alignment_a = kAlignmentA;
+    generated_candidate_result.alignment_b = kAlignmentB;
+    generated_candidate_result.alignment_c = kAlignmentC;
+    generated_candidate_result.split_k_slices = tuned_options.split_k_slices;
+  }
+  return -1;
+}
+
+int profile_ncu_generated_candidate(Options const &options) {
+  int matched = 0;
+#define GEMM_NCU_EXACT_ENTRY(ACCUMULATOR, M, N, K, TRANS, BATCH_COUNT,       \
+                             LAYOUT_A, LAYOUT_B, LAYOUT_C,                    \
+                             ALIGN_A, ALIGN_B, ALIGN_C,                       \
+                             TB_M, TB_N, TB_K, W_M, W_N, W_K,                \
+                             SWIZZLE, STAGES, SPLIT_K)                        \
+  if constexpr (std::is_same<ElementAccumulator, ACCUMULATOR>::value) {       \
+    if (options.m == (M) && options.n == (N) && options.k == (K) &&          \
+        options.trans == (TRANS) && options.batch_count == (BATCH_COUNT)) {   \
+      ++matched;                                                              \
+      profile_ncu_exact_candidate<                                            \
+          LAYOUT_A, LAYOUT_B, LAYOUT_C, ALIGN_A, ALIGN_B, ALIGN_C,           \
+          cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                        \
+          cutlass::gemm::GemmShape<W_M, W_N, W_K>, SWIZZLE, STAGES>(         \
+              "NCU-exact TB" #TB_M "x" #TB_N "x" #TB_K                     \
+              "_W" #W_M "x" #W_N "x" #W_K "_S" #STAGES,                  \
+              SPLIT_K, options);                                              \
+    }                                                                         \
+  }
+#if __has_include("ncu_exact_configurations.inc")
+#include "ncu_exact_configurations.inc"
+#endif
+#undef GEMM_NCU_EXACT_ENTRY
+  return matched;
+}
+
 int maximum_fp16_alignment(int extent) {
   if (extent % 8 == 0) return 8;
   if (extent % 4 == 0) return 4;
@@ -1210,11 +1470,18 @@ int maximum_fp16_alignment(int extent) {
   return 1;
 }
 
-template <int kAlignmentA>
+int maximum_shared_fp16_alignment(int first, int second) {
+  if (first % 8 == 0 && second % 8 == 0) return 8;
+  if (first % 4 == 0 && second % 4 == 0) return 4;
+  if (first % 2 == 0 && second % 2 == 0) return 2;
+  return 1;
+}
+
+template <typename LayoutA, typename LayoutB, typename LayoutC, int kAlignmentA>
 int profile_large_m_by_alignment_b(Options const &options, int alignment_b) {
 #define DISPATCH_LARGE_M(ALIGN_B)                                             \
   return profile_large_m_candidates<                                         \
-      LayoutAAttention, LayoutBAttention, LayoutCAttention,                   \
+      LayoutA, LayoutB, LayoutC,                                              \
       kAlignmentA, ALIGN_B, kAlignmentA,                                     \
       (kAlignmentA == 1 || ALIGN_B == 1) ? 2 : 3>(options)
   switch (alignment_b) {
@@ -1226,29 +1493,37 @@ int profile_large_m_by_alignment_b(Options const &options, int alignment_b) {
 #undef DISPATCH_LARGE_M
 }
 
+template <typename LayoutA, typename LayoutB, typename LayoutC>
 int profile_large_m_by_alignment(Options const &options) {
-  int alignment_a = maximum_fp16_alignment(options.m);
-  int alignment_b = maximum_fp16_alignment(options.k);
+  int alignment_a = maximum_shared_fp16_alignment(
+      std::is_same<LayoutA, cutlass::layout::ColumnMajor>::value
+          ? options.m : options.k,
+      options.m);  // This dispatch currently shares A and C alignment.
+  int alignment_b = maximum_fp16_alignment(
+      std::is_same<LayoutB, cutlass::layout::ColumnMajor>::value
+          ? options.k : options.n);
   switch (alignment_a) {
-    case 8: return profile_large_m_by_alignment_b<8>(options, alignment_b);
-    case 4: return profile_large_m_by_alignment_b<4>(options, alignment_b);
-    case 2: return profile_large_m_by_alignment_b<2>(options, alignment_b);
-    default: return profile_large_m_by_alignment_b<1>(options, alignment_b);
+    case 8: return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 8>(options, alignment_b);
+    case 4: return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 4>(options, alignment_b);
+    case 2: return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 2>(options, alignment_b);
+    default: return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 1>(options, alignment_b);
   }
 }
 
-template <int kAlignmentA>
+template <typename LayoutA, typename LayoutB, typename LayoutC, int kAlignmentA>
 int profile_small_m_by_alignment_b(Options const &options, int alignment_b) {
 #define DISPATCH_SMALL_M(ALIGN_B)                                             \
   return profile_all_candidates<                                             \
-      LayoutAAttention, LayoutBAttention, LayoutCAttention,                   \
+      LayoutA, LayoutB, LayoutC,                                              \
       kAlignmentA, ALIGN_B, kAlignmentA>(options)
   // Alignment 1 cannot use the cp.async candidates in profile_all_candidates.
   if constexpr (kAlignmentA == 1) {
-    return profile_large_m_by_alignment_b<kAlignmentA>(options, alignment_b);
+    return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC,
+                                         kAlignmentA>(options, alignment_b);
   } else {
     if (alignment_b == 1) {
-      return profile_large_m_by_alignment_b<kAlignmentA>(options, alignment_b);
+      return profile_large_m_by_alignment_b<LayoutA, LayoutB, LayoutC,
+                                           kAlignmentA>(options, alignment_b);
     }
     switch (alignment_b) {
       case 8: DISPATCH_SMALL_M(8);
@@ -1259,14 +1534,20 @@ int profile_small_m_by_alignment_b(Options const &options, int alignment_b) {
 #undef DISPATCH_SMALL_M
 }
 
+template <typename LayoutA, typename LayoutB, typename LayoutC>
 int profile_small_m_by_alignment(Options const &options) {
-  int alignment_a = maximum_fp16_alignment(options.m);
-  int alignment_b = maximum_fp16_alignment(options.k);
+  int alignment_a = maximum_shared_fp16_alignment(
+      std::is_same<LayoutA, cutlass::layout::ColumnMajor>::value
+          ? options.m : options.k,
+      options.m);  // This dispatch currently shares A and C alignment.
+  int alignment_b = maximum_fp16_alignment(
+      std::is_same<LayoutB, cutlass::layout::ColumnMajor>::value
+          ? options.k : options.n);
   switch (alignment_a) {
-    case 8: return profile_small_m_by_alignment_b<8>(options, alignment_b);
-    case 4: return profile_small_m_by_alignment_b<4>(options, alignment_b);
-    case 2: return profile_small_m_by_alignment_b<2>(options, alignment_b);
-    default: return profile_small_m_by_alignment_b<1>(options, alignment_b);
+    case 8: return profile_small_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 8>(options, alignment_b);
+    case 4: return profile_small_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 4>(options, alignment_b);
+    case 2: return profile_small_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 2>(options, alignment_b);
+    default: return profile_small_m_by_alignment_b<LayoutA, LayoutB, LayoutC, 1>(options, alignment_b);
   }
 }
 
@@ -1296,6 +1577,63 @@ int profile_unmapped_by_alignment(Options const &options) {
     case 2: return profile_unmapped_by_alignment_b<2, kLargeM>(options, alignment_b);
     default: return profile_unmapped_by_alignment_b<1, kLargeM>(options, alignment_b);
   }
+}
+
+template <typename LayoutA, typename LayoutB>
+int profile_cublas_layout(Options const &options) {
+  using LayoutC = cutlass::layout::ColumnMajor;
+  if (kNcuExactOnly) {
+    generated_candidate_result = GeneratedCandidateResult{};
+    int matched = profile_ncu_generated_candidate(options);
+    if (matched > 0 && generated_candidate_result.available) {
+      std::cout << "\nBest configuration: "
+                << generated_candidate_result.name << "\n"
+                << "  avg_time: "
+                << generated_candidate_result.result.avg_time_ms << " ms\n"
+                << "  gflops: "
+                << generated_candidate_result.result.gflops << "\n";
+      print_generated_record(
+          "CUTLASS_BEST", options, generated_candidate_result.result);
+      return EXIT_SUCCESS;
+    }
+    std::cerr << "NCU-exact: no runnable exact accumulator/M/N/K/trans/"
+                 "batch_count mapping; fallback is disabled.\n";
+    return EXIT_FAILURE;
+  }
+  if (kOptimalOnly) {
+    // Existing optimal entries describe one exact physical layout. The
+    // trans-aware key prevents accidentally reusing them for another layout.
+    int optimal_status = profile_optimal_only_candidate(options);
+    if (optimal_status != -1) return optimal_status;
+    std::cout << "Optimal-only: no exact M/N/K/trans mapping; selecting one "
+                 "deterministic pseudo-random fallback template.\n";
+    return profile_unmapped_single_candidate<
+        LayoutA, LayoutB, LayoutC, 1, 1, 1, 2>(options);
+  }
+  generated_candidate_result = GeneratedCandidateResult{};
+  // Both optional generated sources emit CUTLASS_CANDIDATE records. The NCU
+  // candidate is measured after the cuBLASLt-derived candidate and replaces
+  // the in-process generated winner only when it is faster. The multi-round
+  // optimal generator independently compares every emitted record.
+  profile_cublaslt_generated_candidate(options);
+  profile_ncu_generated_candidate(options);
+  // Keep runtime-selectable NN/NT/TN/TT builds tractable: each physical
+  // layout instantiates an aligned Tensor Core path and a universally legal
+  // synchronous fallback. Environment-specific optimal entries can still
+  // replace this single-candidate path after trans-aware tuning.
+  int const contiguous_a =
+      std::is_same<LayoutA, cutlass::layout::ColumnMajor>::value
+          ? options.m : options.k;
+  int const contiguous_b =
+      std::is_same<LayoutB, cutlass::layout::ColumnMajor>::value
+          ? options.k : options.n;
+  if (contiguous_a % 8 == 0 && contiguous_b % 8 == 0 &&
+      options.m % 8 == 0) {
+    return profile_all_candidates<
+        LayoutA, LayoutB, LayoutC, 8, 8, 8>(options);
+  }
+  return profile_unmapped_single_candidate<
+      LayoutA, LayoutB, LayoutC, 1, 1, 1, 2>(options);
 }
 
 }  // namespace
@@ -1343,33 +1681,21 @@ int main(int argc, char const **argv) {
     return EXIT_FAILURE;
   }
 
-  if (kOptimalOnly) {
-    int optimal_status = profile_optimal_only_candidate(options);
-    if (optimal_status != -1) {
-      return optimal_status;
-    }
-    std::cout << "Optimal-only: no exact M/N/K mapping; selecting one "
-                 "deterministic pseudo-random fallback template.\n";
-    if (options.m == 1) {
-      return profile_unmapped_single_candidate<
-          LayoutAM1, LayoutBM1, LayoutCM1, 8, 8, 8, 4>(options);
-    }
-    // The optimal-only fallback shares the same independent A/C-versus-B
-    // alignment dispatch as the full candidate path below.
-    return options.m >= 128 ? profile_unmapped_by_alignment<true>(options)
-                            : profile_unmapped_by_alignment<false>(options);
+  // Step 4: map cuBLAS transa/transb to the equivalent CUTLASS physical
+  // layouts. A/B identities and M/N/K are supplied by the Qwen operation
+  // mapping in run_gemm.sh; changing trans alone is intentionally insufficient.
+  if (options.trans == "NN") {
+    return profile_cublas_layout<
+        cutlass::layout::ColumnMajor, cutlass::layout::ColumnMajor>(options);
   }
-
-  // A generated exact-shape template takes precedence. A return value of -1
-  // means no local cuBLASLt mapping exists and preserves the baseline search.
-  profile_cublaslt_generated_candidate(options);
-
-  // Step 4: select the physical layout used by the cuBLAS comparison.
-  if (options.m == 1) {
-    return profile_all_candidates<
-        LayoutAM1, LayoutBM1, LayoutCM1,
-        kAlignmentAM1, kAlignmentBM1, kAlignmentCM1>(options);
+  if (options.trans == "NT") {
+    return profile_cublas_layout<
+        cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>(options);
   }
-  return options.m >= 128 ? profile_large_m_by_alignment(options)
-                          : profile_small_m_by_alignment(options);
+  if (options.trans == "TN") {
+    return profile_cublas_layout<
+        cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>(options);
+  }
+  return profile_cublas_layout<
+      cutlass::layout::RowMajor, cutlass::layout::RowMajor>(options);
 }

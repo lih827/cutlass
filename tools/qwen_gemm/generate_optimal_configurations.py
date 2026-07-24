@@ -15,7 +15,7 @@ from pathlib import Path
 RECORD = re.compile(r"^CUTLASS_CANDIDATE\s+(.+)$")
 FIELD = re.compile(r"(\w+)=([^\s]+)")
 REQUIRED = (
-    "m", "n", "k", "source", "name", "accumulator",
+    "m", "n", "k", "trans", "batch_count", "source", "name", "accumulator",
     "layout_a", "layout_b", "layout_c",
     "align_a", "align_b", "align_c", "tb_m", "tb_n", "tb_k",
     "warp_m", "warp_n", "warp_k", "swizzle", "stages", "split_k",
@@ -41,7 +41,8 @@ def parse_logs(paths: list[Path]):
                 raise ValueError(f"Incomplete record in {path}: missing {','.join(missing)}")
             if fields["valid"] != "1":
                 continue
-            shape = tuple(int(fields[name]) for name in ("m", "n", "k"))
+            shape = (*tuple(int(fields[name]) for name in ("m", "n", "k")),
+                     fields["trans"], int(fields["batch_count"]))
             key = (shape, config_key(fields))
             samples[key].append((float(fields["avg_time_ms"]), float(fields["gflops"])))
             configurations[key] = fields
@@ -52,7 +53,8 @@ def parse_logs(paths: list[Path]):
 
 def load_manifest(path: Path):
     with path.open(encoding="utf-8", newline="") as stream:
-        return {(int(row["m"]), int(row["n"]), int(row["k"])): row
+        return {(int(row["m"]), int(row["n"]), int(row["k"]), row["trans"],
+                 int(row["batch_count"])): row
                 for row in csv.DictReader(stream)}
 
 
@@ -61,7 +63,8 @@ def load_cublaslt(paths: list[Path]):
     for path in paths:
         with path.open(encoding="utf-8", newline="") as stream:
             for row in csv.DictReader(stream):
-                shape = tuple(int(row[name]) for name in ("m", "n", "k"))
+                shape = (*tuple(int(row[name]) for name in ("m", "n", "k")),
+                         row.get("trans", "NN"), int(row.get("batch_count", 1)))
                 values[shape] = row
     return values
 
@@ -157,6 +160,8 @@ def main() -> int:
             "stages_used": manifest[shape]["stages"],
             "operations": manifest[shape]["operations"],
             "lengths": manifest[shape]["lengths"],
+            "configuration_origin": "direct:measured-cutlass-candidate",
+            "selection_origin": "derived:minimum-median-time-across-rounds",
         })
         lt = cublaslt.get(shape, {})
         winner["cublaslt_gflops"] = lt.get("cublaslt_gflops", "")
@@ -181,8 +186,9 @@ def main() -> int:
         lines.extend([
             f"// {row['models']} | {row['stages_used']} | {row['operations']} | "
             f"source={row['source']} median_gflops={float(row['median_gflops']):.4f}",
-            f"GEMM_OPTIMAL_ENTRY_EX({accumulator_type}, "
-            f"{row['m']}, {row['n']}, {row['k']},",
+            f"GEMM_OPTIMAL_ENTRY_TRANS_EX({accumulator_type}, "
+            f"{row['m']}, {row['n']}, {row['k']}, \"{row['trans']}\", "
+            f"{row['batch_count']},",
             f"    {row['layout_a']}, {row['layout_b']}, {row['layout_c']}, "
             f"{row['align_a']}, {row['align_b']}, {row['align_c']},",
             f"    {row['tb_m']}, {row['tb_n']}, {row['tb_k']}, "
@@ -200,12 +206,13 @@ def main() -> int:
     args.output.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
     report_fields = [
-        "m", "n", "k", "models", "stages_used", "operations", "lengths",
+        "m", "n", "k", "trans", "batch_count", "models", "stages_used",
+        "operations", "lengths",
         "source", "name", "accumulator", "layout_a", "layout_b", "layout_c",
         "align_a", "align_b", "align_c", "tb_m", "tb_n", "tb_k",
         "warp_m", "warp_n", "warp_k", "swizzle", "stages", "split_k",
         "samples", "median_time_ms", "median_gflops", "cublaslt_gflops",
-        "cutlass_over_cublaslt",
+        "cutlass_over_cublaslt", "configuration_origin", "selection_origin",
     ]
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("w", encoding="utf-8", newline="") as stream:

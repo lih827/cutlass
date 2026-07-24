@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -36,6 +37,8 @@ int get_config(cublasLtMatmulAlgo_t const &algo,
 
 int main(int argc, char **argv) {
   int m = 0, n = 0, k = 0, iterations = 20, requested = 32;
+  int batch_count = 1;
+  std::string trans_string = "NN";
   size_t workspace_bytes = 64ull << 20;
   for (int i = 1; i < argc; ++i) {
     std::string a(argv[i]);
@@ -44,20 +47,31 @@ int main(int argc, char **argv) {
       return false;
     };
     if (integer("--m=", m) || integer("--n=", n) || integer("--k=", k) ||
-        integer("--iterations=", iterations) || integer("--candidates=", requested)) continue;
+        integer("--iterations=", iterations) || integer("--candidates=", requested) ||
+        integer("--batch-count=", batch_count)) continue;
     if (a.rfind("--workspace-mb=", 0) == 0)
       workspace_bytes = size_t(std::stoull(a.substr(15))) << 20;
+    else if (a.rfind("--trans=", 0) == 0)
+      trans_string = a.substr(8);
     else if (a == "--help") {
       std::cout << "Usage: cublaslt_profiler --m=M --n=N --k=K [--iterations=20] "
+                   "[--trans=NN|NT|TN|TT] [--batch-count=1] "
                    "[--candidates=32] [--workspace-mb=64]\n";
       return 0;
     } else { std::cerr << "Unknown argument: " << a << "\n"; return 2; }
   }
-  if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0 || requested <= 0) return 2;
+  std::transform(trans_string.begin(), trans_string.end(), trans_string.begin(), ::toupper);
+  if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0 || requested <= 0 ||
+      batch_count <= 0 ||
+      (trans_string != "NN" && trans_string != "NT" &&
+       trans_string != "TN" && trans_string != "TT")) return 2;
 
-  size_t a_bytes = size_t(m) * k * sizeof(__half);
-  size_t b_bytes = size_t(k) * n * sizeof(__half);
-  size_t c_bytes = size_t(m) * n * sizeof(__half);
+  size_t a_elements = size_t(m) * k;
+  size_t b_elements = size_t(k) * n;
+  size_t c_elements = size_t(m) * n;
+  size_t a_bytes = a_elements * batch_count * sizeof(__half);
+  size_t b_bytes = b_elements * batch_count * sizeof(__half);
+  size_t c_bytes = c_elements * batch_count * sizeof(__half);
   __half *A = nullptr, *B = nullptr, *C = nullptr, *D = nullptr;
   void *workspace = nullptr;
   CUDA_CHECK(cudaMalloc(&A, a_bytes)); CUDA_CHECK(cudaMalloc(&B, b_bytes));
@@ -70,14 +84,39 @@ int main(int argc, char **argv) {
   cublasLtMatrixLayout_t ad{}, bd{}, cd{}, dd{}; cublasLtMatmulPreference_t pref{};
   LT_CHECK(cublasLtCreate(&lt));
   LT_CHECK(cublasLtMatmulDescCreate(&op, kComputeType, kScaleType));
-  cublasOperation_t trans = CUBLAS_OP_N;
-  LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)));
-  LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &trans, sizeof(trans)));
-  // Column-major NN: A[M,K], B[K,N], C/D[M,N].
-  LT_CHECK(cublasLtMatrixLayoutCreate(&ad, CUDA_R_16F, m, k, m));
-  LT_CHECK(cublasLtMatrixLayoutCreate(&bd, CUDA_R_16F, k, n, k));
+  cublasOperation_t transa = trans_string[0] == 'T' ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t transb = trans_string[1] == 'T' ? CUBLAS_OP_T : CUBLAS_OP_N;
+  LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+  LT_CHECK(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+  int const a_rows = transa == CUBLAS_OP_N ? m : k;
+  int const a_cols = transa == CUBLAS_OP_N ? k : m;
+  int const b_rows = transb == CUBLAS_OP_N ? k : n;
+  int const b_cols = transb == CUBLAS_OP_N ? n : k;
+  LT_CHECK(cublasLtMatrixLayoutCreate(&ad, CUDA_R_16F, a_rows, a_cols, a_rows));
+  LT_CHECK(cublasLtMatrixLayoutCreate(&bd, CUDA_R_16F, b_rows, b_cols, b_rows));
   LT_CHECK(cublasLtMatrixLayoutCreate(&cd, CUDA_R_16F, m, n, m));
   LT_CHECK(cublasLtMatrixLayoutCreate(&dd, CUDA_R_16F, m, n, m));
+  if (batch_count > 1) {
+    int64_t stride_a = int64_t(a_elements);
+    int64_t stride_b = int64_t(b_elements);
+    int64_t stride_c = int64_t(c_elements);
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        ad, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        bd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        cd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        dd, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        ad, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_a, sizeof(stride_a)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        bd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_b, sizeof(stride_b)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        cd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+    LT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        dd, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride_c, sizeof(stride_c)));
+  }
   LT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
   LT_CHECK(cublasLtMatmulPreferenceSetAttribute(
       pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)));
@@ -115,9 +154,12 @@ int main(int argc, char **argv) {
   get_config(h.algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, reduction);
   get_config(h.algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, swizzle);
   get_config(h.algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, custom);
-  double gflops = 2.0 * double(m) * n * k / (double(best_ms) * 1.0e6);
+  double gflops = 2.0 * double(m) * n * k * batch_count /
+                  (double(best_ms) * 1.0e6);
   std::cout << std::fixed << std::setprecision(4)
             << "CUBLASLT_BEST m=" << m << " n=" << n << " k=" << k
+            << " trans=" << trans_string
+            << " batch_count=" << batch_count
             << " accumulator=" << kAccumulatorName
             << " algo_id=" << algo_id << " tile_id=" << tile_id
             << " stages_id=" << stages_id << " split_k=" << split_k

@@ -1,0 +1,2 @@
+accumulator,m,n,k,trans,batch_count,layout_a,layout_b,layout_c,align_a,align_b,align_c,ncu_tb_m,ncu_tb_n,ncu_tb_k,warp_m,warp_n,warp_k,swizzle,ncu_stages,split_k
+fp32,128,3584,3584,NN,1,cutlass::layout::ColumnMajor,cutlass::layout::ColumnMajor,cutlass::layout::ColumnMajor,8,8,8,128,64,32,64,32,32,Identity,3,1
