@@ -271,11 +271,14 @@ cutlass_...gemm_<CTA_M>x<CTA_N>_<CTA_K>x<Stages>_<nn|nt|tn|tt>_align<N>
 实测；`--ncu-exact` 严格运行模式也会只在 NCU-exact 集合内部比较这些候选，
 选择其中实测最快的一项，不会进入基础或 cuBLASLt-derived fallback。
 
-NCU 抓取采用 `--replay-mode application --profile-from-start off`。
+NCU 抓取采用 `--replay-mode kernel --profile-from-start off`。
 `cublaslt_profiler` 会先在采集区间外实测 heuristic candidates，选出 winner
 后调用 `cudaProfilerStart()`，只向 NCU 暴露最终 winner 的一次 launch，再
 调用 `cudaProfilerStop()`。因此 NCU 不会 replay 用于筛选的全部 cuBLASLt
-候选，可显著降低连续全量用例抓取时的报告规模和显存压力。
+候选，只对该 winner 执行 Kernel Replay，可显著降低连续全量用例抓取时的
+报告规模和显存压力。这里不能使用 Application Replay，因为 heuristic
+筛选在不同应用重启之间不保证产生完全一致的 kernel 序列，NCU 可能报告
+`unexpected number of profiled kernels`。
 
 正式性能测试已经确认模板正确时，可关闭正确性校验及其数据准备/拷贝：
 
