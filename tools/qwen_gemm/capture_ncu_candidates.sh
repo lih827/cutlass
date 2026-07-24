@@ -64,9 +64,11 @@ while IFS=',' read -r m n k trans batch_count operand_a operand_b models stages 
 
   echo "[NCU $case_id] MxNxK=${m}x${n}x${k} trans=$trans batch=$batch_count"
   "$ncu_command" --target-processes all --set basic --force-overwrite \
+    --replay-mode application --profile-from-start off \
     --kernel-name-base demangled -o "$report_prefix" \
     "$executable" "--m=$m" "--n=$n" "--k=$k" "--trans=$trans" \
-    "--batch-count=$batch_count" "--iterations=$iterations"
+    "--batch-count=$batch_count" "--iterations=$iterations" \
+    "--profile-winner-only"
   "$ncu_command" --import "$report_file" --csv --page raw > "$raw_csv"
 
   # Manifest fields do not contain commas; preserve the exact strings for

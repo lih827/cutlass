@@ -14,48 +14,35 @@ cutlass/
 ├── README_gemm_runtime.md
 ├── build_gemm.sh
 ├── run_gemm.sh
-├── tune_optimal_cutlass.sh
 ├── examples/gemm/
 │   ├── gemm.cu
-│   ├── cublaslt_profiler.cu
-│   ├── optimal_configurations.inc
-│   ├── ncu_exact_configurations.inc       # 可选
-│   └── cublaslt_generated_candidates.inc
+│   ├── optimal_configurations.inc          # 可选配置结果
+│   └── ncu_exact_configurations.inc        # 可选配置结果
 ├── tools/qwen_gemm/
 │   ├── collect_gemm_results.py
 │   ├── estimate_qwen_gemm.py
-│   ├── generate_qwen_shapes.py
-│   ├── generate_cutlass_candidates.py
-│   ├── generate_optimal_configurations.py
-│   └── tune_cutlass_from_cublaslt.sh
+│   └── generate_qwen_shapes.py
 ├── docs/qwen_gemm/
 │   ├── GEMM_CODE_GUIDE.md
 │   ├── qwen2.5推理中gemm算子使用.docx
 │   └── qwen2_5_0_5b_prefill_decode_flow.svg
 └── outputs/qwen_gemm/                 # 可重新生成，不提交 Git
-
-../../qwen_gemm_artifacts/             # CUTLASS 仓库外
-├── qwen_decode_gemm_package.tar.gz
-├── gemm_performance_comparison.xlsx
-├── up_gate_test.log
-└── up_gate_test.xlsx
 ```
 
 | 文件 | 用途 |
 |---|---|
-| `README_gemm_runtime.md` | 不依赖调优过程的构建、运行和结果处理说明 |
+| `README_gemm_runtime.md` | 构建、运行和结果处理说明 |
 | `build_gemm.sh` | 编译 GEMM，选择架构、计时器、累加器及 optimal-only |
 | `run_gemm.sh` | 根据模型参数运行 Decode/Prefill 全量用例 |
 | `gemm.cu` | CUTLASS FP16 输入、FP32 默认累加的 GEMM 测试主体 |
 | `optimal_configurations.inc` | 可选的 optimal-only 精确配置 |
 | `ncu_exact_configurations.inc` | 可选 NCU-exact 严格映射；仅 `--ncu-exact` 构建需要 |
-| `collect_gemm_results.py` | 将运行日志结果写入仓外对比工作簿 |
+| `collect_gemm_results.py` | 将运行日志结果写入用户指定的对比工作簿 |
 | `estimate_qwen_gemm.py` | 根据实测时间估算 Qwen GEMM-only forward |
 | `GEMM_CODE_GUIDE.md` | `gemm.cu` 模块结构与维护同步说明 |
 | `qwen2.5推理中gemm算子使用.docx` | 0.5B 实测 cuBLAS 调用参数和接口参考 |
 | `qwen2_5_0_5b_prefill_decode_flow.svg` | Prefill/Decode 流程与 GEMM 位置图 |
-| `outputs/qwen_gemm` | 日志、清单、二进制和调优中间结果 |
-| `qwen_gemm_artifacts` | CUTLASS 仓外的交付包、工作簿和历史测试结果 |
+| `outputs/qwen_gemm` | 运行生成的日志、清单和二进制 |
 
 `build_gemm.sh` 和 `run_gemm.sh` 必须从 CUTLASS 根目录执行。
 
@@ -141,9 +128,9 @@ bash build_gemm.sh --arch sm_89 --optimal-only
 
 `--optimal-only` 只读取 `examples/gemm/optimal_configurations.inc`。映射按
 accumulator 类型与精确 `M/N/K` 联合匹配，不会把 FP16 最优模板直接用于
-FP32。文件不存在、累加器类型未调优或 shape 未命中时确定性地选择 fallback。
-交付包当前内置 FP16 实测映射；若要让 FP32 optimal-only 使用最优模板，需要
-在目标环境单独完成 FP32 调优并保留更新后的同一 `.inc` 文件。
+FP32。文件不存在、缺少对应 accumulator 映射或 shape 未命中时确定性地
+选择 fallback。如需使用预先生成的配置，只需将对应 `.inc` 文件复制到
+`examples/gemm/` 并重新编译。
 
 已确认模板正确后，可关闭 reference 和结果校验以减少整用例耗时：
 
@@ -413,11 +400,11 @@ bash run_gemm.sh --model 7b --stage prefill | tee cutlass_prefill.log
 ```bash
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_decode.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
+  --workbook gemm_performance_comparison.xlsx
 
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
+  --workbook gemm_performance_comparison.xlsx
 ```
 
 输出到新文件：
@@ -425,7 +412,7 @@ python3 tools/qwen_gemm/collect_gemm_results.py \
 ```bash
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx \
+  --workbook gemm_performance_comparison.xlsx \
   --output gemm_performance_comparison_filled.xlsx
 ```
 

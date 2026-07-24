@@ -5,8 +5,7 @@
 ## 目录结构与文件用途
 
 Qwen GEMM 扩展不是 CUTLASS 上游原生产物。为避免污染 CUTLASS 根目录，
-根目录只保留 README 和三个常用入口；辅助工具、生成结果和仓外交付物分类
-存放：
+根目录只保留 README 和三个常用入口；辅助工具与生成结果分类存放：
 
 ```text
 cutlass/
@@ -42,12 +41,6 @@ cutlass/
     ├── logs/
     ├── cublaslt_tuning/
     └── optimal_tuning/
-
-../../qwen_gemm_artifacts/             # CUTLASS 仓库外
-├── qwen_decode_gemm_package.tar.gz
-├── gemm_performance_comparison.xlsx
-├── up_gate_test.log
-└── up_gate_test.xlsx
 ```
 
 | 文件 | 用途 |
@@ -69,17 +62,16 @@ cutlass/
 | `generate_ncu_exact_configurations.py` | 原样保留 NCU CTA M/N/K、Stages 并生成严格分派 |
 | `capture_ncu_candidates.sh` | 在目标 GPU 上逐用例运行 NCU 并保留原始报告 |
 | `parse_ncu_candidates.py` | 解析已验证 kernel 命名规则并枚举合法 WarpShape |
-| `collect_gemm_results.py` | 解析日志并回填仓外 XLSX |
+| `collect_gemm_results.py` | 解析日志并回填用户指定的 XLSX |
 | `estimate_qwen_gemm.py` | 从实测最佳时间估算 GEMM-only forward 延迟 |
 | `tune_cutlass_from_cublaslt.sh` | 单模型 cuBLASLt 候选采样辅助流程 |
 | `GEMM_CODE_GUIDE.md` | `gemm.cu` 的模块、调用链、数据流和维护同步说明 |
 | `qwen2.5推理中gemm算子使用.docx` | 0.5B Prefill/Decode 实测 cuBLAS 接口、M/N/K、trans 和 batchCount 参考 |
 | `qwen2_5_0_5b_prefill_decode_flow.svg` | 0.5B Prefill/Decode 算子流程及 GEMM 位置示意图 |
 
-`docs/qwen_gemm` 保存本测试依赖的 Qwen 实测参考资料副本；仓外原件不移动。
+`docs/qwen_gemm` 保存本测试依赖的 Qwen 实测参考资料。
 `outputs/qwen_gemm` 中的日志、清单、二进制和调优中间结果均可重新生成，
-不属于 CUTLASS 原生源码。`../../qwen_gemm_artifacts` 中的压缩包、XLSX
-和历史测试结果是仓外交付物，不得提交到 CUTLASS 仓库。
+不属于 CUTLASS 原生源码。
 
 `build_gemm.sh` 和 `run_gemm.sh` 都必须从 CUTLASS 根目录执行。
 
@@ -278,6 +270,12 @@ cutlass_...gemm_<CTA_M>x<CTA_N>_<CTA_K>x<Stages>_<nn|nt|tn|tt>_align<N>
 同一个 NCU CTA/Stages 可以对应多个 WarpShape 补全候选。普通调优会全部
 实测；`--ncu-exact` 严格运行模式也会只在 NCU-exact 集合内部比较这些候选，
 选择其中实测最快的一项，不会进入基础或 cuBLASLt-derived fallback。
+
+NCU 抓取采用 `--replay-mode application --profile-from-start off`。
+`cublaslt_profiler` 会先在采集区间外实测 heuristic candidates，选出 winner
+后调用 `cudaProfilerStart()`，只向 NCU 暴露最终 winner 的一次 launch，再
+调用 `cudaProfilerStop()`。因此 NCU 不会 replay 用于筛选的全部 cuBLASLt
+候选，可显著降低连续全量用例抓取时的报告规模和显存压力。
 
 正式性能测试已经确认模板正确时，可关闭正确性校验及其数据准备/拷贝：
 
@@ -793,8 +791,8 @@ awk -v prefill="$PREFILL_MS" -v decode="$DECODE_MS" \
 仓库提供：
 
 ```text
-collect_gemm_results.py           CUTLASS 日志解析和结果回填脚本
-gemm_performance_comparison.xlsx  Excel 对比模板
+tools/qwen_gemm/collect_gemm_results.py  CUTLASS 日志解析和结果回填脚本
+gemm_performance_comparison.xlsx         用户指定的 Excel 对比表
 ```
 
 先运行 CUTLASS 用例并保存完整日志。脚本按 `M/N/K` 定位 Excel 模板中的行，只更新 CUTLASS 最佳配置和 GFLOPS；HGEMM 数据、加速比公式和格式均会保留。
@@ -805,12 +803,12 @@ gemm_performance_comparison.xlsx  Excel 对比模板
 ./run_gemm.sh --model 7b --stage decode | tee cutlass_decode.log
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_decode.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
+  --workbook gemm_performance_comparison.xlsx
 
 ./run_gemm.sh --model 7b --stage prefill | tee cutlass_prefill.log
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx
+  --workbook gemm_performance_comparison.xlsx
 ```
 
 如需保留空白模板，可输出到新 XLSX：
@@ -818,7 +816,7 @@ python3 tools/qwen_gemm/collect_gemm_results.py \
 ```bash
 python3 tools/qwen_gemm/collect_gemm_results.py \
   --log cutlass_prefill.log \
-  --workbook ../../qwen_gemm_artifacts/gemm_performance_comparison.xlsx \
+  --workbook gemm_performance_comparison.xlsx \
   --output gemm_performance_comparison_filled.xlsx
 ```
 

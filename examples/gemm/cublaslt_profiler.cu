@@ -1,5 +1,6 @@
 #include <cublasLt.h>
 #include <cuda_fp16.h>
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -38,6 +39,7 @@ int get_config(cublasLtMatmulAlgo_t const &algo,
 int main(int argc, char **argv) {
   int m = 0, n = 0, k = 0, iterations = 20, requested = 32;
   int batch_count = 1;
+  bool profile_winner_only = false;
   std::string trans_string = "NN";
   size_t workspace_bytes = 64ull << 20;
   for (int i = 1; i < argc; ++i) {
@@ -53,10 +55,13 @@ int main(int argc, char **argv) {
       workspace_bytes = size_t(std::stoull(a.substr(15))) << 20;
     else if (a.rfind("--trans=", 0) == 0)
       trans_string = a.substr(8);
+    else if (a == "--profile-winner-only")
+      profile_winner_only = true;
     else if (a == "--help") {
       std::cout << "Usage: cublaslt_profiler --m=M --n=N --k=K [--iterations=20] "
                    "[--trans=NN|NT|TN|TT] [--batch-count=1] "
-                   "[--candidates=32] [--workspace-mb=64]\n";
+                   "[--candidates=32] [--workspace-mb=64] "
+                   "[--profile-winner-only]\n";
       return 0;
     } else { std::cerr << "Unknown argument: " << a << "\n"; return 2; }
   }
@@ -146,6 +151,17 @@ int main(int argc, char **argv) {
   if (best < 0) { std::cerr << "No runnable cuBLASLt candidate\n"; return 1; }
 
   auto const &h = heuristics[best];
+  if (profile_winner_only) {
+    // NCU runs with --profile-from-start off. Keep heuristic benchmarking
+    // outside the collection range and expose only one launch of the selected
+    // winner, avoiding replay of every heuristic candidate.
+    CUDA_CHECK(cudaProfilerStart());
+    LT_CHECK(cublasLtMatmul(
+        lt, op, &alpha, A, ad, B, bd, &beta, C, cd, D, dd,
+        &h.algo, workspace, workspace_bytes, 0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaProfilerStop());
+  }
   int algo_id = -1, tile_id = 0, stages_id = 0, split_k = 0, reduction = 0, swizzle = 0, custom = 0;
   get_config(h.algo, CUBLASLT_ALGO_CONFIG_ID, algo_id);
   get_config(h.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, tile_id);
